@@ -1778,6 +1778,7 @@ impl App {
         match m.kind {
             MouseEventKind::Moved => self.pointer = Some(Position { x, y }),
             MouseEventKind::Down(btn) => {
+                self.pointer = Some(Position { x, y });
                 if self.help {
                     self.help = false;
                     return;
@@ -1802,9 +1803,13 @@ impl App {
                 match hit {
                     Hit::Row(i) => {
                         self.select(i);
+                        self.pointer = Some(Position { x, y });
                         let kind = self.view().selected().map(|s| s.kind);
                         if btn == MouseButton::Right {
                             self.activate();
+                        } else if btn == MouseButton::Left && self.view().source == Source::Home {
+                            self.open_selected();
+                            self.last_click = None;
                         } else if dbl {
                             match kind {
                                 Some(k) if k.is_container() => self.open_selected(),

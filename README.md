@@ -72,7 +72,7 @@ Press `/` and type. Results update live. Start the query with a prefix to filter
 
 Commands work like vim: `:vol 50`, `:seek 1:23`, `:shuffle on`, `:repeat track`, `:play spotify:album:…`, `:q`.
 
-The mouse works too. Click to select and double-click to play or open. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
+Click a cover tile to open it. In lists, click to select and double-click to play or open. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
 
 ### Queue
 

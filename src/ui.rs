@@ -855,6 +855,8 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
 fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
     const GAP: u16 = 3;
     const CARD_W: u16 = 18;
+    const SELECTED_BG: Color = Color::Rgb(48, 48, 48);
+    const HOVER_BG: Color = Color::Rgb(58, 58, 58);
     // 1-col inset so the selection frame has room on the left
     let area = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
     let cols = ((area.width + GAP) / (CARD_W + GAP)).max(1);
@@ -862,7 +864,7 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
     // small enough that at least two rows of cards fit
     let max_cover_h = (area.height / 2).saturating_sub(4).max(4);
     let (cw, cover_h) = square(app, cw, max_cover_h);
-    let card_h = cover_h + 4; // selection rule, cover, name, count, gap
+    let card_h = cover_h + 4; // top padding, cover, name, count, gap
     let rows_vis = ((area.height + 1) / card_h) as usize;
     if rows_vis == 0 {
         return;
@@ -885,28 +887,19 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
     let cards: Vec<(usize, Item)> =
         v.items.iter().enumerate().skip(first).take(rows_vis * cols_us).map(|(i, it)| (i, it.clone())).collect();
 
-    let card_rect = |n: usize| {
-        let (row, col) = ((n / cols_us) as u16, (n % cols_us) as u16);
-        Rect::new(
-            area.x + col * (cw + GAP),
-            area.y + row * card_h,
-            cw,
-            card_h - 1,
-        )
-    };
-    let hovered = pointer.and_then(|p| (0..cards.len()).find(|&n| card_rect(n).contains(p)));
     for (n, (idx, it)) in cards.into_iter().enumerate() {
-        let card = card_rect(n);
-        let x = card.x;
+        let (row, col) = ((n / cols_us) as u16, (n % cols_us) as u16);
+        let x = area.x + col * (cw + GAP);
+        let card = Rect::new(x, area.y + row * card_h, cw, cover_h + 3);
         let y = card.y + 1;
-        let is_sel = hovered.map_or(idx == sel, |i| i == n);
+        let is_sel = idx == sel;
+        let hovered = pointer.is_some_and(|p| card.contains(p));
         let playing = ctx.as_deref() == Some(it.uri.as_str()) && !it.uri.is_empty();
 
-        if is_sel {
-            f.render_widget(
-                Line::styled("─".repeat(cw as usize), Style::new().fg(FG)),
-                Rect::new(x, card.y, cw, 1),
-            );
+        if is_sel || hovered {
+            let bg = if hovered { HOVER_BG } else { SELECTED_BG };
+            let frame = Rect::new(x - 1, card.y, cw + 2, card.height).intersection(f.area());
+            f.render_widget(Block::new().style(Style::new().bg(bg)), frame);
         }
         let cover_r = Rect::new(x, y, cw, cover_h);
         match (&it.image, it.kind) {
