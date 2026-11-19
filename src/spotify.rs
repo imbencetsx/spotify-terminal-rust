@@ -80,7 +80,7 @@ impl Api {
             Source::Playlist(id) => self.playlist(id, offset).await,
             Source::Artist(id) => self.artist(id, offset).await,
             Source::Liked => self.liked(offset).await,
-            Source::Queue => Ok(Page::default()),
+            Source::Queue | Source::Lyrics => Ok(Page::default()),
         }
     }
 

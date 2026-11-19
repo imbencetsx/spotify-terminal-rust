@@ -364,10 +364,6 @@ fn player(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
         y += 2;
         volume(f, app, row(y), &pal);
 
-        let dev_y = inner.bottom().saturating_sub(1);
-        if dev_y > y + 1 {
-            device_line(f, app, row(dev_y), &pal);
-        }
     } else {
         // compact: title · artist / progress / controls + volume
         let line = match &p.item {
@@ -418,7 +414,7 @@ fn controls(f: &mut Frame, app: &mut App, r: Rect, pal: &Pal) {
     let on = |b: bool| Style::new().fg(if b { accent() } else { pal.dim(y) });
     let toggle = if p.playing() { " ⏸ " } else { " ▶ " };
     let btns: [(Hit, &str, Style); 5] = [
-        (Hit::Shuffle, "⇄", on(p.shuffle)),
+        (Hit::Shuffle, "⇄", on(app.shuffle_enabled())),
         (Hit::Prev, "⏮", Style::new().fg(pal.text(y))),
         (Hit::Toggle, toggle, Style::new().fg(on_accent()).bg(accent()).bold()),
         (Hit::Next, "⏭", Style::new().fg(pal.text(y))),
@@ -460,24 +456,6 @@ fn volume(f: &mut Frame, app: &mut App, r: Rect, pal: &Pal) {
     ]);
     f.render_widget(line, Rect::new(x, r.y, total.min(r.width), 1));
     app.hits.push((Rect::new(x + 5, r.y, bw, 1), Hit::Volume));
-}
-
-fn device_line(f: &mut Frame, app: &App, r: Rect, pal: &Pal) {
-    let p = &app.player;
-    let w = r.width as usize;
-    let dim = Style::new().fg(pal.dim(r.y));
-    let line = if !p.connected {
-        let why = if p.down_reason.is_empty() { "connecting to soloist…" } else { &p.down_reason };
-        Line::from(vec![Span::styled("○ ", Style::new().fg(RED)), Span::styled(trunc(why, w - 2), dim)])
-    } else if !p.logged_in {
-        let msg = format!("pick “{}” once in a Spotify app to log in", p.device);
-        Line::from(vec![Span::styled("◐ ", Style::new().fg(YELLOW)), Span::styled(trunc(&msg, w - 2), dim)])
-    } else {
-        let ctx = p.context.as_ref().map(|c| format!(" · {}", c.name)).unwrap_or_default();
-        let dot = if p.active { Span::styled("● ", Style::new().fg(accent())) } else { Span::styled("◐ ", dim) };
-        Line::from(vec![dot, Span::styled(trunc(&format!("{}{ctx}", p.device), w - 2), dim)])
-    };
-    f.render_widget(line.alignment(Alignment::Center), r);
 }
 
 // --------------------------------------------------------------- list ----
@@ -549,6 +527,35 @@ fn crumbs(f: &mut Frame, app: &mut App, area: Rect) -> u16 {
 /// A view's header (cover + info) and its rows.
 fn pane(f: &mut Frame, app: &mut App, area: Rect) {
     let mut y = area.y;
+    if app.view().source == Source::Queue && !app.view().items.is_empty() && area.height >= 3 {
+        let local = app.queued_len();
+        let sel = app.view().sel;
+        let mut x = area.x;
+        for (label, delta, enabled) in [
+            (" ↑ K ", -1, sel > 0 && sel < local),
+            (" ↓ J ", 1, sel + 1 < local),
+        ] {
+            let style = if enabled {
+                Style::new().fg(FG).bg(SEL_BG)
+            } else {
+                Style::new().fg(DIM)
+            };
+            let r = Rect::new(x, y, sw(label), 1).intersection(area);
+            f.render_widget(Line::styled(label, style), r);
+            if enabled {
+                app.hits.push((r, Hit::QueueMove(delta)));
+            }
+            x += sw(label) + 1;
+        }
+        let label = if sel < local {
+            "Move queued song"
+        } else {
+            "Spotify upcoming • read-only"
+        };
+        let r = Rect::new(x, y, area.right().saturating_sub(x), 1);
+        f.render_widget(Line::styled(label, Style::new().fg(DIM)), r);
+        y += 2;
+    }
     if let Some(h) = app.view().header.clone()
         && area.height > 12
     {
@@ -614,7 +621,10 @@ fn rows(f: &mut Frame, app: &mut App, body: Rect) {
     // album pages (one cover for every song) and narrow panes stay compact
     let v = app.view();
     let rich = !v.items.is_empty()
-        && !matches!(v.source, Source::Album(_) | Source::Artist(_))
+        && !matches!(
+            v.source,
+            Source::Album(_) | Source::Artist(_) | Source::Queue
+        )
         && body.width >= 50
         && body.height >= 6;
     if rich {
@@ -765,6 +775,7 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
 fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
     let h = body.height as usize;
+    let local = app.queued_len();
     let v = top(app);
     if v.items.is_empty() {
         let info = EmptyInfo { source: v.source.clone(), error: v.error.clone(), loading: v.loading, note: v.note.clone() };
@@ -774,6 +785,7 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
         return;
     }
     let numbered = matches!(v.source, Source::Album(_) | Source::Playlist(_) | Source::Liked | Source::Queue);
+    let queue = v.source == Source::Queue;
     scroll_into_view(v, h);
     let (scroll, sel) = (v.scroll, v.sel);
     let items: Vec<Item> = v.items.iter().skip(scroll).take(h).cloned().collect();
@@ -792,7 +804,9 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
         let is_sel = idx == sel;
         let playing = playing_uri.as_deref() == Some(it.uri.as_str()) && !it.uri.is_empty();
         let bg = if is_sel { SEL_BG } else { BG };
-        let marker = if playing {
+        let marker = if queue && idx < local {
+            Span::styled("↕ ", Style::new().fg(if is_sel { accent() } else { MUTED }))
+        } else if playing {
             Span::styled("▶ ", Style::new().fg(accent()))
         } else if is_sel {
             Span::styled("▎ ", Style::new().fg(accent()))
@@ -841,19 +855,24 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
 fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
     const GAP: u16 = 3;
     const CARD_W: u16 = 18;
+    const SELECTED_BG: Color = Color::Rgb(48, 48, 48);
+    const HOVER_BG: Color = Color::Rgb(58, 58, 58);
     // 1-col inset so the selection frame has room on the left
     let area = Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), area.height);
     let cols = ((area.width + GAP) / (CARD_W + GAP)).max(1);
     let cw = ((area.width + GAP) / cols).saturating_sub(GAP).max(8);
     // small enough that at least two rows of cards fit
-    let max_cover_h = (area.height / 2).saturating_sub(3).max(4);
+    let max_cover_h = (area.height / 2).saturating_sub(4).max(4);
     let (cw, cover_h) = square(app, cw, max_cover_h);
-    let card_h = cover_h + 3; // cover, name, count, gap
-    let rows_vis = (area.height / card_h).max(1) as usize;
+    let card_h = cover_h + 4; // top padding, cover, name, count, gap
+    let rows_vis = ((area.height + 1) / card_h) as usize;
+    if rows_vis == 0 {
+        return;
+    }
     let cols_us = cols as usize;
     app.lib_cols = cols_us;
     app.list_height = rows_vis * cols_us;
-    let focused = true;
+    let pointer = app.pointer;
 
     let ctx = app.player.context.as_ref().map(|c| c.uri.clone());
     let v = top(app);
@@ -871,14 +890,15 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
     for (n, (idx, it)) in cards.into_iter().enumerate() {
         let (row, col) = ((n / cols_us) as u16, (n % cols_us) as u16);
         let x = area.x + col * (cw + GAP);
-        let y = area.y + row * card_h;
+        let card = Rect::new(x, area.y + row * card_h, cw, cover_h + 3);
+        let y = card.y + 1;
         let is_sel = idx == sel;
+        let hovered = pointer.is_some_and(|p| card.contains(p));
         let playing = ctx.as_deref() == Some(it.uri.as_str()) && !it.uri.is_empty();
 
-        // selection: a soft frame around the whole card
-        if is_sel {
-            let frame = Rect::new(x - 1, y, cw + 2, cover_h + 2).intersection(f.area());
-            let bg = if focused { Color::Rgb(48, 48, 48) } else { Color::Rgb(32, 32, 32) };
+        if is_sel || hovered {
+            let bg = if hovered { HOVER_BG } else { SELECTED_BG };
+            let frame = Rect::new(x - 1, card.y, cw + 2, card.height).intersection(f.area());
             f.render_widget(Block::new().style(Style::new().bg(bg)), frame);
         }
         let cover_r = Rect::new(x, y, cw, cover_h);
@@ -909,7 +929,7 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
             Line::styled(trunc(&sub, cw as usize), Style::new().fg(if is_sel { MUTED } else { DIM })),
             Rect::new(x, y + cover_h + 1, cw, 1),
         );
-        app.hits.push((Rect::new(x, y, cw, cover_h + 2), Hit::Row(idx)));
+        app.hits.push((card, Hit::Row(idx)));
     }
 }
 
@@ -1076,20 +1096,17 @@ fn footer(f: &mut Frame, app: &App, r: Rect) {
         (None, Mode::Normal) => {
             let p = &app.player;
             if !p.connected {
-                vec![
-                    Span::styled("○ ", Style::new().fg(RED)),
-                    Span::styled(trunc(if p.down_reason.is_empty() { "connecting…" } else { &p.down_reason }, room / 2), dim),
-                ]
+                let reason = if p.down_reason.is_empty() {
+                    "Connecting to Soloist…"
+                } else {
+                    &p.down_reason
+                };
+                vec![Span::styled(trunc(reason, room), Style::new().fg(RED))]
+            } else if !p.logged_in {
+                let msg = format!("Select “{}” in Spotify to connect", p.device);
+                vec![Span::styled(trunc(&msg, room), dim)]
             } else {
-                let mut v = vec![
-                    Span::styled(if p.active { "● " } else { "◐ " }, Style::new().fg(if p.active { accent() } else { DIM })),
-                    Span::styled(p.device.clone(), dim),
-                ];
-                if let Some(c) = &p.context {
-                    v.push(sep());
-                    v.push(Span::styled(trunc(&c.name, room / 3), dim));
-                }
-                v
+                Vec::new()
             }
         }
     };
@@ -1122,6 +1139,7 @@ fn help(f: &mut Frame, area: Rect) {
         ("h  ←  ⌫", "back", "]  [", "seek ±10s"),
         ("o", "open playing album", "a", "add to queue"),
         ("H   Tab", "playlists   queue", "P", "play this album / list"),
+        ("K   J", "move queued song up/down", "", ""),
         ("", "", "", ""),
         ("SEARCH", "", "COMMANDS", ""),
         ("/  i", "search", ":vol 50", ":seek 1:23  :seek +30"),

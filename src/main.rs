@@ -5,6 +5,8 @@ mod config;
 mod install;
 mod lyrics;
 mod model;
+#[cfg(target_os = "macos")]
+mod now_playing;
 mod soloist;
 mod spotify;
 mod ui;
@@ -96,7 +98,7 @@ async fn run() -> Result<()> {
         "play" => oneshot(&cfg, ctl("play", arg.map_or(Value::Null, |u| json!({ "uri": u })))).await,
         "pause" => oneshot(&cfg, ctl("pause", Value::Null)).await,
         "next" | "skip" => oneshot(&cfg, ctl("skip_next", Value::Null)).await,
-        "prev" | "previous" => oneshot(&cfg, ctl("skip_prev", Value::Null)).await,
+        "prev" | "previous" => soloist::previous(&addr(&cfg)?).await,
         "vol" | "volume" => {
             let v: u8 = arg.context("usage: str vol <0-100>")?.parse().context("volume must be 0-100")?;
             oneshot(&cfg, ctl("set_volume", json!({ "volume": v.min(100) }))).await
@@ -210,9 +212,9 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
     let first_run = cfg.client_id.is_none() && cfg.soloist.api_key.is_none() && soloist::endpoint(&cfg).is_none();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-    let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Value>();
+    let (ws_tx, ws_rx) = mpsc::unbounded_channel();
     let (sol_tx, mut sol_rx) = mpsc::unbounded_channel::<soloist::Event>();
-    tokio::spawn(soloist::run(cfg.clone(), sol_tx, ws_rx));
+    let connection = tokio::spawn(soloist::run(cfg.clone(), sol_tx, ws_rx));
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -235,7 +237,13 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
 
     let needs_login = cfg.client_id.is_some() && api.is_none();
     let art = cfg.art.as_deref().map(art::Style::parse).unwrap_or(art::Style::Pixel);
-    let mut app = App::new(cfg, api, None, http, tx, ws_tx, picker);
+    #[cfg(target_os = "macos")]
+    let media = if cfg.now_playing.unwrap_or(true) {
+        now_playing::Bridge::start(tx.clone()).map(Some)
+    } else {
+        Ok(None)
+    };
+    let mut app = App::new(cfg.clone(), api, None, http, tx, ws_tx, picker);
     app.art = art;
     if let Some(b) = app.cfg.background.as_deref() {
         app.bg_mode = art::BgMode::parse(b);
@@ -248,9 +256,30 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
     } else if needs_login {
         app.start_login();
     }
+    #[cfg(target_os = "macos")]
+    let media = match media {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            app.error(format!("macOS Now Playing unavailable: {e:#}"));
+            None
+        }
+    };
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let termination = async {
+        #[cfg(unix)]
+        if let Ok(signal) = &mut terminate {
+            signal.recv().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(termination);
 
     let res: Result<()> = async {
         loop {
@@ -258,6 +287,8 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
             app.sync_lyrics();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             tokio::select! {
+                signal = &mut interrupt => return signal.map_err(Into::into),
+                _ = &mut termination => return Ok(()),
                 ev = events.next() => match ev {
                     Some(Ok(ev)) => app.on_event(ev),
                     Some(Err(e)) => return Err(e.into()),
@@ -266,11 +297,15 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
                 Some(m) = rx.recv() => app.on_msg(m),
                 _ = tick.tick() => app.on_tick(),
             }
+            if app.quit {
+                return Ok(());
+            }
             while let Ok(m) = rx.try_recv() {
                 app.on_msg(m);
             }
-            if app.quit {
-                return Ok(());
+            #[cfg(target_os = "macos")]
+            if let Some(media) = &media {
+                media.sync(&app.player, app.shuffle_enabled());
             }
         }
     }
@@ -278,5 +313,32 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
 
     let _ = execute!(std::io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    res
+    connection.abort();
+    let _ = connection.await;
+    let stop_playback = async {
+        if let Some(child) = app.soloist_child.take() {
+            soloist::shutdown_child(child)
+                .await
+                .context("stopping Soloist")
+        } else if let Some(addr) = soloist::endpoint(&cfg) {
+            match tokio::time::timeout(Duration::from_secs(2), soloist::pause_for_exit(&addr)).await
+            {
+                Ok(Err(_)) | Err(_) if !app.player.connected && !app.player.playing() => Ok(()),
+                result => result
+                    .context("timed out stopping playback")
+                    .and_then(|r| r),
+            }
+        } else {
+            Ok(())
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let (cleanup, ()) = tokio::join!(stop_playback, async {
+        if let Some(media) = media {
+            media.stop().await;
+        }
+    });
+    #[cfg(not(target_os = "macos"))]
+    let cleanup = stop_playback.await;
+    res.and(cleanup)
 }

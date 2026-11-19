@@ -17,6 +17,8 @@ pub struct Config {
     pub images: Option<String>,
     /// Look up lyrics on lrclib.net (sends the song's title/artist/album/length).
     pub lyrics: Option<bool>,
+    /// Publish playback state and controls to macOS Now Playing.
+    pub now_playing: Option<bool>,
     pub soloist: SoloistCfg,
 }
 
@@ -53,6 +55,8 @@ pub const TEMPLATE: &str = r#"# str — config
 # Lyrics (L) come from lrclib.net, which gets the playing song's title,
 # artist, album and length. Turn off with:
 # lyrics = false
+# Use macOS Control Center and media keys:
+# now_playing = true
 
 [soloist]
 # 2. Playback goes through Spotify Soloist's WebSocket API.
