@@ -305,7 +305,7 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
             }
             #[cfg(target_os = "macos")]
             if let Some(media) = &media {
-                media.sync(&app.player);
+                media.sync(&app.player, app.shuffle_enabled());
             }
         }
     }

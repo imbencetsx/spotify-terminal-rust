@@ -149,12 +149,13 @@ pub enum Event {
     Up,
     Down(String),
     Msg(Value),
-    PreviousError(String),
+    ControlError(String),
 }
 
 pub enum Request {
     Send(Value),
     Previous,
+    PlayCollection { uri: String, shuffle: bool },
 }
 
 /// Keep a connection to Soloist alive forever, forwarding events and commands.
@@ -197,7 +198,15 @@ pub async fn run(
                                         let _ = tx.send(Event::Msg(v.clone()));
                                     }).await;
                                     if let Err(e) = result {
-                                        let _ = tx.send(Event::PreviousError(format!("{e:#}")));
+                                        let _ = tx.send(Event::ControlError(format!("{e:#}")));
+                                    }
+                                }
+                                Some(Request::PlayCollection { uri, shuffle }) => {
+                                    let result = play_collection(&mut ws, &uri, shuffle, |v| {
+                                        let _ = tx.send(Event::Msg(v.clone()));
+                                    }).await;
+                                    if let Err(e) = result {
+                                        let _ = tx.send(Event::ControlError(format!("{e:#}")));
                                     }
                                 }
                                 None => return,
@@ -485,25 +494,73 @@ pub async fn previous(addr: &str) -> Result<()> {
     previous_on(&mut ws, |_| {}).await
 }
 
+async fn play_collection(
+    ws: &mut Ws,
+    uri: &str,
+    shuffle: bool,
+    mut observe: impl FnMut(&Value),
+) -> Result<()> {
+    // A command result confirms dispatch. Confirm the actual option before
+    // starting the context so its first track is picked in the requested mode.
+    let set_shuffle = async {
+        let state = playback_state(ws, &mut observe).await?;
+        if state["options"]["shuffle"].as_bool() == Some(shuffle) {
+            return Ok(());
+        }
+        send(ws, "set_shuffle", json!({ "enabled": shuffle })).await?;
+        let mut accepted = false;
+        let mut enabled = None;
+        loop {
+            let v = next_json(ws).await?;
+            observe(&v);
+            match v["type"].as_str() {
+                Some("command_result") if v["command"] == "set_shuffle" => {
+                    accepted = true;
+                    if enabled != Some(shuffle) {
+                        send(ws, "get_state", Value::Null).await?;
+                    }
+                }
+                Some("options_changed" | "playback_state") => {
+                    enabled = v["options"]["shuffle"].as_bool().or(enabled);
+                }
+                Some("error") => bail!(
+                    "{}",
+                    v["message"].as_str().unwrap_or("couldn't set shuffle")
+                ),
+                _ => {}
+            }
+            if accepted && enabled == Some(shuffle) {
+                return Ok(());
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), set_shuffle)
+        .await
+        .context("soloist didn't confirm the shuffle setting")??;
+    send(ws, "play", json!({ "uri": uri })).await
+}
+
+async fn playback_state(ws: &mut Ws, observe: &mut impl FnMut(&Value)) -> Result<Value> {
+    send(ws, "get_state", Value::Null).await?;
+    loop {
+        let v = next_json(ws).await?;
+        observe(&v);
+        match v["type"].as_str() {
+            Some("playback_state") => return Ok(v),
+            Some("error") => bail!(
+                "{}",
+                v["message"].as_str().unwrap_or("couldn't get playback state")
+            ),
+            _ => {}
+        }
+    }
+}
+
 /// Soloist restarts the current track if it's already well underway. Seek to
 /// the start and wait for the position update before dispatching Previous.
 async fn previous_on(ws: &mut Ws, mut observe: impl FnMut(&Value)) -> Result<()> {
     let run = async {
-        send(ws, "get_state", Value::Null).await?;
-        let state = loop {
-            let v = next_json(ws).await?;
-            observe(&v);
-            match v["type"].as_str() {
-                Some("playback_state") => break v,
-                Some("error") => bail!(
-                    "{}",
-                    v["message"]
-                        .as_str()
-                        .unwrap_or("couldn't get playback state")
-                ),
-                _ => {}
-            }
-        };
+        let state = playback_state(ws, &mut observe).await?;
         let mut player = Player::default();
         player.apply(&state);
         if player.position() > 1_000 {
@@ -668,6 +725,43 @@ mod tests {
         let c = command("seek", json!({"position_ms": 5}));
         assert_eq!(c, json!({"type":"command","command":"seek","position_ms":5}));
         assert_eq!(command("pause", Value::Null), json!({"type":"command","command":"pause"}));
+    }
+
+    #[tokio::test]
+    async fn collection_waits_for_the_confirmed_shuffle_setting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uri = "spotify:playlist:test";
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let read = |m: Message| serde_json::from_str::<Value>(m.to_text().unwrap()).unwrap();
+            let message = |v: Value| Message::text(v.to_string());
+            for shuffle in [true, false] {
+                let old = message(json!({
+                    "type": "playback_state", "options": {"shuffle": !shuffle}
+                }));
+                assert_eq!(read(ws.next().await.unwrap().unwrap())["command"], "get_state");
+                ws.send(old.clone()).await.unwrap();
+                assert_eq!(
+                    read(ws.next().await.unwrap().unwrap()),
+                    command("set_shuffle", json!({"enabled": shuffle}))
+                );
+                ws.send(message(json!({"type": "command_result", "command": "set_shuffle"}))).await.unwrap();
+                assert_eq!(read(ws.next().await.unwrap().unwrap())["command"], "get_state");
+                ws.send(old).await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(30), ws.next()).await.is_err());
+                ws.send(message(json!({"type": "options_changed", "options": {"shuffle": shuffle}}))).await.unwrap();
+                assert_eq!(
+                    read(ws.next().await.unwrap().unwrap()),
+                    command("play", json!({"uri": uri}))
+                );
+            }
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        play_collection(&mut ws, uri, true, |_| {}).await.unwrap();
+        play_collection(&mut ws, uri, false, |_| {}).await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

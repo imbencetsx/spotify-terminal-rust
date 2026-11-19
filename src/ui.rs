@@ -414,7 +414,7 @@ fn controls(f: &mut Frame, app: &mut App, r: Rect, pal: &Pal) {
     let on = |b: bool| Style::new().fg(if b { accent() } else { pal.dim(y) });
     let toggle = if p.playing() { " ⏸ " } else { " ▶ " };
     let btns: [(Hit, &str, Style); 5] = [
-        (Hit::Shuffle, "⇄", on(p.shuffle)),
+        (Hit::Shuffle, "⇄", on(app.shuffle_enabled())),
         (Hit::Prev, "⏮", Style::new().fg(pal.text(y))),
         (Hit::Toggle, toggle, Style::new().fg(on_accent()).bg(accent()).bold()),
         (Hit::Next, "⏭", Style::new().fg(pal.text(y))),
@@ -528,7 +528,7 @@ fn crumbs(f: &mut Frame, app: &mut App, area: Rect) -> u16 {
 fn pane(f: &mut Frame, app: &mut App, area: Rect) {
     let mut y = area.y;
     if app.view().source == Source::Queue && !app.view().items.is_empty() && area.height >= 3 {
-        let local = app.queued.len();
+        let local = app.queued_len();
         let sel = app.view().sel;
         let mut x = area.x;
         for (label, delta, enabled) in [
@@ -775,7 +775,7 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
 fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
     let h = body.height as usize;
-    let local = app.queued.len();
+    let local = app.queued_len();
     let v = top(app);
     if v.items.is_empty() {
         let info = EmptyInfo { source: v.source.clone(), error: v.error.clone(), loading: v.loading, note: v.note.clone() };

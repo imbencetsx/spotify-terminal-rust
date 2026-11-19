@@ -72,7 +72,7 @@ Press `/` and type. Results update live. Start the query with a prefix to filter
 
 Commands work like vim: `:vol 50`, `:seek 1:23`, `:shuffle on`, `:repeat track`, `:play spotify:album:…`, `:q`.
 
-Click a cover tile to open it. In lists, click to select and double-click to play or open. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
+Click a cover tile to open it or a song to play it. In the queue, click to select and double-click to play. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
 
 ### Queue
 
@@ -93,7 +93,7 @@ Album art is drawn as text so it fits the terminal. `A` cycles the style, and `a
 
 - Search returns 10 results per page. `str` loads more pages as you scroll.
 - Spotify only lists the songs of playlists you own. Other playlists still play with `⏎`.
-- Soloist's `play` can't start partway into an album. So `⏎` on song N of an album plays that song and queues the rest. `⏎` on the first song plays the whole album.
+- Clicking a song or pressing `⏎` on it plays that exact song, then queues the following loaded songs. Use the album or playlist’s Play button or `P` to start the full collection in order or shuffled, according to the shuffle toggle.
 
 ## Develop
 

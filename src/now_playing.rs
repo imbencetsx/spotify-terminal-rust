@@ -98,7 +98,7 @@ impl Bridge {
         })
     }
 
-    pub fn sync(&self, player: &Player) {
+    pub fn sync(&self, player: &Player, shuffle: bool) {
         let item = player.item.as_ref().filter(|_| {
             player.connected
                 && player.logged_in
@@ -118,7 +118,7 @@ impl Bridge {
                     "timestamp": player.pos_ts,
                     "rate": if player.playing() { player.speed } else { 0.0 },
                     "playing": player.playing(),
-                    "shuffle": player.shuffle,
+                    "shuffle": shuffle,
                     "repeat": match player.repeat {
                         Repeat::Off => "off",
                         Repeat::Context => "context",
