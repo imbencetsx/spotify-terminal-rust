@@ -207,7 +207,12 @@ async fn main() {
                                 "get_queue" => out.push(json!({"type":"queue_changed","previous":[],"upcoming": s.queue.iter().enumerate().map(|(i, _)| json!({"uid": i.to_string(), "source":"queue", "item": entity(&s, i + 1)})).collect::<Vec<_>>()})),
                                 "play" => {
                                     freeze(&mut s);
-                                    if v["uri"].is_string() { s.track += 1; s.pos = 0; broadcast.push(json!({"type":"track_changed","item": entity(&s, s.track)})); }
+                                    if let Some(uri) = v["uri"].as_str() {
+                                        s.track = uri.strip_prefix("spotify:track:mock")
+                                            .and_then(|n| n.parse().ok()).unwrap_or(s.track + 1);
+                                        s.pos = 0;
+                                        broadcast.push(json!({"type":"track_changed","item": entity(&s, s.track)}));
+                                    }
                                     s.playing = true;
                                     broadcast.push(json!({"type":"playback_changed","status":"playing"}));
                                     broadcast.push(json!({"type":"position_sync","position": position(&s)}));
@@ -219,9 +224,17 @@ async fn main() {
                                     broadcast.push(json!({"type":"position_sync","position": position(&s)}));
                                 }
                                 "skip_next" | "skip_prev" => {
-                                    s.track = if cmd == "skip_next" { s.track + 1 } else { s.track + TRACKS.len() - 1 };
+                                    freeze(&mut s);
+                                    let old_track = s.track;
+                                    if cmd == "skip_next" {
+                                        s.track += 1;
+                                    } else if s.pos < 3_000 {
+                                        s.track = s.track.checked_sub(1).unwrap_or(TRACKS.len() - 1);
+                                    }
                                     s.pos = 0; s.ts = now();
-                                    broadcast.push(json!({"type":"track_changed","item": entity(&s, s.track)}));
+                                    if s.track != old_track {
+                                        broadcast.push(json!({"type":"track_changed","item": entity(&s, s.track)}));
+                                    }
                                     broadcast.push(json!({"type":"position_sync","position": position(&s)}));
                                 }
                                 "seek" => { s.pos = v["position_ms"].as_u64().unwrap_or(0); s.ts = now(); broadcast.push(json!({"type":"position_sync","position": position(&s)})); }

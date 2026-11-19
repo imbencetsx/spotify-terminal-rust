@@ -19,17 +19,28 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub enum Msg {
     Soloist(soloist::Event),
-    Page { view: u64, offset: usize, result: Result<Box<Page>, String> },
-    Image { url: String, img: Option<DynamicImage> },
-    Queued { ok: usize, name: String },
+    Page {
+        view: u64,
+        offset: usize,
+        result: Result<Box<Page>, String>,
+    },
+    Image {
+        url: String,
+        img: Option<DynamicImage>,
+    },
+    Queued {
+        items: Vec<Item>,
+        name: String,
+    },
     LoginUrl(String),
     InstallProgress(u8),
     Installed { result: Result<String, String>, then_start: bool },
-    SoloistExited(Option<i32>),
     NeedsUpdate(i64),
     StartSoloist,
     Login(Result<crate::auth::Token, String>),
     Lyrics { uri: String, state: crate::lyrics::State },
+    #[cfg(target_os = "macos")]
+    Media(crate::now_playing::Action),
 }
 
 /// The setup screen: paste credentials, save them to config.toml, log in.
@@ -199,6 +210,14 @@ pub enum Hit {
     Lyrics,
     /// A line on the lyrics page: seeks there.
     LyricLine(usize),
+    QueueMove(isize),
+}
+
+struct QueueStart {
+    item: Item,
+    from: Option<Item>,
+    index: usize,
+    since: Instant,
 }
 
 pub struct Art {
@@ -212,8 +231,14 @@ pub struct App {
     pub api_problem: Option<String>,
     http: reqwest::Client,
     tx: UnboundedSender<Msg>,
-    ws: UnboundedSender<Value>,
+    ws: UnboundedSender<soloist::Request>,
     pub player: Player,
+    pub queued: Vec<Item>,
+    queue_start: Option<QueueStart>,
+    queue_history: Vec<(String, Item)>,
+    queue_retry_blocked: bool,
+    manual_advance: Option<Instant>,
+    pub soloist_child: Option<tokio::process::Child>,
     pub views: Vec<View>,
     pub mode: Mode,
     pub query: Input,
@@ -240,6 +265,7 @@ pub struct App {
     pub protos: [Option<Art>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
     pub hits: Vec<(Rect, Hit)>,
+    pub pointer: Option<Position>,
     pub list_height: usize,
     /// Columns of the playlist cover grid (set while drawing; 1 = plain list).
     pub lib_cols: usize,
@@ -272,7 +298,7 @@ impl App {
         api_problem: Option<String>,
         http: reqwest::Client,
         tx: UnboundedSender<Msg>,
-        ws: UnboundedSender<Value>,
+        ws: UnboundedSender<soloist::Request>,
         picker: Picker,
     ) -> Self {
         let mut app = App {
@@ -283,6 +309,12 @@ impl App {
             tx,
             ws,
             player: Player::default(),
+            queued: Vec::new(),
+            queue_start: None,
+            queue_history: Vec::new(),
+            queue_retry_blocked: false,
+            manual_advance: None,
+            soloist_child: None,
             views: Vec::new(),
             mode: Mode::Normal,
             query: Input::default(),
@@ -304,6 +336,7 @@ impl App {
             protos: [None, None],
             art_cache: HashMap::new(),
             hits: Vec::new(),
+            pointer: None,
             list_height: 20,
             lib_cols: 1,
             backdrop: None,
@@ -402,10 +435,60 @@ impl App {
             self.back();
             return;
         }
-        let mut v = self.new_view("Queue", Source::Queue);
-        v.items = self.player.queue.clone();
+        let v = self.new_view("Queue", Source::Queue);
         self.views.push(v);
-        self.send("get_queue", json!({ "limit": 50 }));
+        self.refresh_queue_views();
+        if self.player.logged_in {
+            self.send("get_queue", json!({ "limit": 0 }));
+        }
+    }
+
+    fn refresh_queue_views(&mut self) {
+        for v in self.views.iter_mut().filter(|v| v.source == Source::Queue) {
+            v.items.clear();
+            v.items
+                .extend(self.queued.iter().chain(&self.player.queue).cloned());
+            v.sel = v.sel.min(v.items.len().saturating_sub(1));
+        }
+    }
+
+    fn move_queue_item(&mut self, delta: isize) {
+        let from = self.view().sel;
+        if from >= self.queued.len() {
+            self.info("Songs added in Spotify follow Spotify’s queue order");
+            return;
+        }
+        let to = from.saturating_add_signed(delta).min(self.queued.len() - 1);
+        self.queued.swap(from, to);
+        self.refresh_queue_views();
+        self.select(to);
+    }
+
+    fn start_queued(&mut self, index: usize) {
+        if self.queue_start.is_some() || index >= self.queued.len() {
+            return;
+        }
+        self.ensure_active();
+        let item = &self.queued[index];
+        if self.send("play", json!({ "uri": item.uri })) {
+            self.queue_retry_blocked = false;
+            self.queue_start = Some(QueueStart {
+                item: self.queued.remove(index),
+                from: self.player.item.clone(),
+                index,
+                since: Instant::now(),
+            });
+            self.refresh_queue_views();
+        }
+    }
+
+    fn restore_queue_start(&mut self) {
+        if let Some(start) = self.queue_start.take() {
+            self.queued
+                .insert(start.index.min(self.queued.len()), start.item);
+            self.queue_retry_blocked = true;
+            self.refresh_queue_views();
+        }
     }
 
     fn open(&mut self, it: &Item, focus: Option<String>) {
@@ -454,6 +537,7 @@ impl App {
     }
 
     fn select(&mut self, i: usize) {
+        self.pointer = None;
         if self.view().source == Source::Lyrics {
             // move the lyrics cursor (and stop following the song for a bit)
             let n = self.current_lyrics().map_or(0, |l| l.lines.len());
@@ -531,13 +615,15 @@ impl App {
 
     // ---------------------------------------------------------- playback --
 
-    fn send(&mut self, cmd: &str, extra: Value) {
+    fn send(&mut self, cmd: &str, extra: Value) -> bool {
         if !self.player.connected {
             let r = self.player.down_reason.clone();
             self.error(if r.is_empty() { "soloist not connected".into() } else { r });
-            return;
+            return false;
         }
-        let _ = self.ws.send(soloist::command(cmd, extra));
+        self.ws
+            .send(soloist::Request::Send(soloist::command(cmd, extra)))
+            .is_ok()
     }
 
     fn ensure_active(&mut self) {
@@ -547,24 +633,61 @@ impl App {
     }
 
     fn play_uri(&mut self, uri: &str) {
+        self.queue_history.clear();
+        self.queue_retry_blocked = false;
+        self.manual_advance = Some(Instant::now());
         self.ensure_active();
         self.send("play", json!({ "uri": uri }));
     }
 
     pub fn toggle(&mut self) {
-        self.ensure_active();
-        if self.player.playing() {
-            self.send("pause", Value::Null);
-        } else {
-            self.send("play", Value::Null);
+        self.set_playing(!self.player.playing());
+    }
+
+    fn set_playing(&mut self, playing: bool) {
+        if playing
+            && !self.queued.is_empty()
+            && (self.player.item.is_none() || self.player.status == "idle")
+        {
+            self.start_queued(0);
+            return;
         }
+        self.ensure_active();
+        self.send(if playing { "play" } else { "pause" }, Value::Null);
     }
 
     fn next(&mut self) {
-        self.send("skip_next", Value::Null);
+        if self.queued.is_empty() && self.queue_start.is_none() {
+            self.manual_advance = Some(Instant::now());
+            self.send("skip_next", Value::Null);
+        } else {
+            self.start_queued(0);
+        }
     }
     fn prev(&mut self) {
-        self.send("skip_prev", Value::Null);
+        if self.queue_start.is_some() {
+            return;
+        }
+        self.manual_advance = Some(Instant::now());
+        if let Some(current) = &self.player.item
+            && let Some((to, _)) = self.queue_history.last()
+            && to == &current.uri
+            && self.player.connected
+            && self.player.logged_in
+            && self.player.active
+        {
+            let current = current.clone();
+            let Some((_, previous)) = self.queue_history.pop() else {
+                return;
+            };
+            self.queued.insert(0, current);
+            self.refresh_queue_views();
+            self.send("play", json!({ "uri": previous.uri }));
+        } else if self.player.connected {
+            let _ = self.ws.send(soloist::Request::Previous);
+        } else {
+            self.error("soloist not connected");
+        }
     }
 
     fn shuffle(&mut self, on: Option<bool>) {
@@ -596,8 +719,13 @@ impl App {
     }
 
     fn seek(&mut self, ms: i64) {
-        let d = self.player.duration() as i64;
-        let ms = if d > 0 { ms.clamp(0, d - 500) } else { ms.max(0) } as u64;
+        let d = self.player.duration();
+        let ms = ms.max(0) as u64;
+        let ms = if d > 0 {
+            ms.min(d.saturating_sub(500))
+        } else {
+            ms
+        };
         self.player.pos_ms = ms;
         self.player.pos_ts = crate::model::now_ms();
         self.send("seek", json!({ "position_ms": ms }));
@@ -618,18 +746,22 @@ impl App {
         let v = self.view();
         let Some(it) = v.selected().cloned() else { return };
         let sel = v.sel;
+        if v.source == Source::Queue && sel < self.queued.len() {
+            self.start_queued(sel);
+            return;
+        }
         let container = v
             .header
             .as_ref()
             .filter(|h| matches!(h.kind, Kind::Album | Kind::Playlist))
             .map(|h| (h.uri.clone(), h.name.clone()));
         let in_list = matches!(v.source, Source::Album(_) | Source::Playlist(_) | Source::Liked);
-        let rest: Vec<String> = if in_list {
+        let rest: Vec<Item> = if in_list {
             v.items[sel + 1..]
                 .iter()
                 .filter(|i| i.kind == Kind::Track)
                 .take(25)
-                .map(|i| i.uri.clone())
+                .cloned()
                 .collect()
         } else {
             Vec::new()
@@ -644,10 +776,9 @@ impl App {
                 // play from here: this song, then the rest of the list queued
                 _ if in_list && !rest.is_empty() => {
                     self.play_uri(&it.uri);
-                    for u in &rest {
-                        self.send("add_to_queue", json!({ "uri": u }));
-                    }
                     self.info(format!("▶ {} · {} more queued", it.name, rest.len()));
+                    self.queued.extend(rest);
+                    self.refresh_queue_views();
                 }
                 _ => {
                     self.play_uri(&it.uri);
@@ -685,8 +816,9 @@ impl App {
         let Some(it) = self.view().selected().cloned() else { return };
         match it.kind {
             Kind::Track => {
-                self.send("add_to_queue", json!({ "uri": it.uri }));
                 self.info(format!("+ queued {}", it.name));
+                self.queued.push(it);
+                self.refresh_queue_views();
             }
             Kind::Album | Kind::Playlist | Kind::Liked => {
                 // fetch its tracks, queue them all
@@ -696,23 +828,19 @@ impl App {
                     Kind::Playlist => Source::Playlist(it.id.clone()),
                     _ => Source::Liked,
                 };
-                let (tx, ws, name) = (self.tx.clone(), self.ws.clone(), it.name.clone());
-                if !self.player.connected {
-                    self.error("soloist not connected");
-                    return;
-                }
+                let (tx, name) = (self.tx.clone(), it.name.clone());
                 self.info(format!("queueing {name}…"));
                 tokio::spawn(async move {
-                    let ok = match api.fetch(&src, 0).await {
-                        Ok(p) => p
-                            .items
-                            .iter()
-                            .filter(|i| i.kind == Kind::Track)
-                            .filter(|i| ws.send(soloist::command("add_to_queue", json!({ "uri": i.uri }))).is_ok())
-                            .count(),
-                        Err(_) => 0,
-                    };
-                    let _ = tx.send(Msg::Queued { ok, name });
+                    let items = api.fetch(&src, 0).await.map_or_else(
+                        |_| Vec::new(),
+                        |p| {
+                            p.items
+                                .into_iter()
+                                .filter(|i| i.kind == Kind::Track)
+                                .collect()
+                        },
+                    );
+                    let _ = tx.send(Msg::Queued { items, name });
                 });
             }
             _ => self.error("can't queue that"),
@@ -812,11 +940,14 @@ impl App {
 
     /// Start Soloist if we have an API key and it isn't running; download it first if needed.
     pub fn ensure_soloist(&mut self) {
+        if self.soloist_child.is_some() {
+            return;
+        }
         match soloist::maybe_spawn(&self.cfg) {
             Ok(soloist::Spawn::NotNeeded) => {}
             Ok(soloist::Spawn::Started(child)) => {
                 self.info("starting soloist…");
-                self.watch(child);
+                self.soloist_child = Some(child);
             }
             Ok(soloist::Spawn::Missing) => self.install_soloist(true),
             Err(e) => self.error(format!("couldn't start soloist: {e:#}")),
@@ -842,13 +973,37 @@ impl App {
         });
     }
 
-    /// Tell us when a soloist we started exits (crash, expired build, …).
-    fn watch(&self, mut child: std::process::Child) {
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let code = child.wait().ok().and_then(|s| s.code());
-            let _ = tx.send(Msg::SoloistExited(code));
-        });
+    fn poll_soloist(&mut self) {
+        let Some(child) = &mut self.soloist_child else {
+            return;
+        };
+        let code = match child.try_wait() {
+            Ok(None) => return,
+            Ok(Some(status)) => status.code(),
+            Err(e) => {
+                self.error(format!("couldn't check Soloist: {e}"));
+                return;
+            }
+        };
+        self.soloist_child = None;
+        match code {
+            Some(0) | None => {}
+            Some(10) => {
+                let managed = crate::install::find_bin(&self.cfg)
+                    .is_some_and(|b| crate::install::is_managed(&b));
+                if managed && self.expired_retries < 1 {
+                    self.expired_retries += 1;
+                    self.info("soloist build expired — fetching a new one…");
+                    self.install_soloist(true);
+                } else {
+                    self.error("your soloist build expired — download a newer one (or remove [soloist] bin so str manages it)");
+                }
+            }
+            Some(c) => {
+                let why = soloist::log_tail().unwrap_or_default();
+                self.error(format!("soloist exited ({c}): {why}"));
+            }
+        }
     }
 
     /// Background check: is our own soloist close to expiring?
@@ -935,6 +1090,8 @@ impl App {
 
     pub fn on_msg(&mut self, m: Msg) {
         match m {
+            #[cfg(target_os = "macos")]
+            Msg::Media(action) => self.on_media_action(action),
             Msg::Soloist(soloist::Event::Up) => {
                 self.player.connected = true;
                 self.player.down_reason.clear();
@@ -942,23 +1099,14 @@ impl App {
             Msg::Soloist(soloist::Event::Down(r)) => {
                 self.player.connected = false;
                 self.player.logged_in = false;
+                self.player.queue.clear();
+                self.queue_history.clear();
                 self.player.down_reason = r;
+                self.restore_queue_start();
+                self.refresh_queue_views();
             }
-            Msg::Soloist(soloist::Event::Msg(v)) => match self.player.apply(&v) {
-                Change::LoggedIn => {
-                    self.send("get_state", Value::Null);
-                    self.send("get_queue", json!({ "limit": 50 }));
-                }
-                Change::Queue => {
-                    let q = self.player.queue.clone();
-                    for v in self.views.iter_mut().filter(|v| v.source == Source::Queue) {
-                        v.items = q.clone();
-                        v.sel = v.sel.min(v.items.len().saturating_sub(1));
-                    }
-                }
-                Change::Error(e) => self.error(e),
-                Change::Other => {}
-            },
+            Msg::Soloist(soloist::Event::PreviousError(e)) => self.error(e),
+            Msg::Soloist(soloist::Event::Msg(v)) => self.on_player_event(v),
             Msg::Page { view, offset, result } => {
                 let is_top = self.views.last().is_some_and(|v| v.id == view);
                 let Some(v) = self.view_by_id(view) else { return };
@@ -1045,43 +1193,130 @@ impl App {
                     Err(e) => self.error(format!("couldn't install soloist: {e}")),
                 }
             }
-            Msg::SoloistExited(code) => match code {
-                // 0 = clean shutdown, None = killed (e.g. :stop / :restart)
-                Some(0) | None => {}
-                Some(10) => {
-                    let managed = crate::install::find_bin(&self.cfg).is_some_and(|b| crate::install::is_managed(&b));
-                    if managed && self.expired_retries < 1 {
-                        self.expired_retries += 1;
-                        self.info("soloist build expired — fetching a new one…");
-                        self.install_soloist(true);
-                    } else {
-                        self.error("your soloist build expired — download a newer one (or remove [soloist] bin so str manages it)");
-                    }
-                }
-                Some(c) => {
-                    let why = soloist::log_tail().unwrap_or_default();
-                    self.error(format!("soloist exited ({c}): {why}"));
-                }
-            },
             Msg::NeedsUpdate(days) => {
                 self.info(format!("soloist expires in {days} days — updating…"));
                 self.install_soloist(false);
             }
-            Msg::StartSoloist => self.ensure_soloist(),
+            Msg::StartSoloist => {
+                self.poll_soloist();
+                self.ensure_soloist();
+            }
             Msg::Lyrics { uri, state } => {
                 self.lyrics.insert(uri, state);
             }
-            Msg::Queued { ok, name } => {
-                if ok == 0 {
+            Msg::Queued { items, name } => {
+                if items.is_empty() {
                     self.error(format!("couldn't queue {name}"));
                 } else {
-                    self.info(format!("+ queued {ok} songs from {name}"));
+                    self.info(format!("+ queued {} songs from {name}", items.len()));
+                    self.queued.extend(items);
+                    self.refresh_queue_views();
                 }
             }
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn on_media_action(&mut self, action: crate::now_playing::Action) {
+        use crate::now_playing::Action;
+        if !self.player.connected || !self.player.logged_in || !self.player.active {
+            return;
+        }
+        match action {
+            Action::Play => self.set_playing(true),
+            Action::Pause => self.set_playing(false),
+            Action::Toggle => self.toggle(),
+            Action::Next => self.next(),
+            Action::Previous => self.prev(),
+            Action::Seek(seconds) if seconds.is_finite() => self.seek((seconds * 1000.0) as i64),
+            Action::Seek(_) => {}
+            Action::Shuffle(on) => self.shuffle(Some(on)),
+            Action::Repeat(mode) => self.repeat(Some(match mode.as_str() {
+                "track" => Repeat::Track,
+                "context" => Repeat::Context,
+                _ => Repeat::Off,
+            })),
+        }
+    }
+
+    fn on_player_event(&mut self, event: Value) {
+        let kind = event["type"].as_str().unwrap_or_default();
+        let track_update = matches!(kind, "track_changed" | "playback_state");
+        let track_changed = track_update
+            && event["item"]["uri"].as_str() != self.player.item.as_ref().map(|i| i.uri.as_str());
+        let duration = self.player.duration();
+        let finishing = self.player.playing()
+            && duration > 0
+            && self.player.position().saturating_add(350) >= duration;
+        let was_starting = self.queue_start.is_some();
+        match self.player.apply(&event) {
+            Change::LoggedIn => {
+                self.send("get_state", Value::Null);
+                self.send("get_queue", json!({ "limit": 0 }));
+            }
+            Change::Queue => self.refresh_queue_views(),
+            Change::Error(e) => self.error(e),
+            Change::Other => {}
+        }
+        if self.queue_start.as_ref().is_some_and(|start| {
+            self.player
+                .item
+                .as_ref()
+                .is_some_and(|i| i.uri == start.item.uri)
+                && (kind == "track_changed"
+                    || (matches!(kind, "position_sync" | "playback_state")
+                        && self.player.pos_ms < 1_000))
+        }) && let Some(start) = self.queue_start.take()
+            && let Some(from) = start.from.filter(|i| i.uri != start.item.uri)
+        {
+            self.queue_history.push((start.item.uri, from));
+        }
+        let manually_changed = self
+            .manual_advance
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        if track_changed {
+            self.manual_advance = None;
+        }
+        if finishing
+            && (track_changed || matches!(self.player.status.as_str(), "idle" | "stopped"))
+            && !was_starting
+            && !manually_changed
+            && self.can_auto_advance()
+        {
+            self.start_queued(0);
+        }
+    }
+
+    fn can_auto_advance(&self) -> bool {
+        !self.queued.is_empty()
+            && !self.queue_retry_blocked
+            && self.player.connected
+            && self.player.logged_in
+            && self.player.active
+            && self.player.repeat != Repeat::Track
+    }
+
     pub fn on_tick(&mut self) {
+        self.poll_soloist();
+        if self
+            .queue_start
+            .as_ref()
+            .is_some_and(|s| s.since.elapsed() >= Duration::from_secs(5))
+        {
+            self.restore_queue_start();
+            self.error("Soloist didn’t start the queued song. Press n to retry.");
+        }
+        let duration = self.player.duration();
+        if self.can_auto_advance()
+            && self
+                .manual_advance
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+            && self.player.playing()
+            && duration > 0
+            && self.player.position() >= duration
+        {
+            self.start_queued(0);
+        }
         if self.search_due.is_some_and(|t| Instant::now() >= t) {
             self.run_search();
         }
@@ -1347,6 +1582,20 @@ impl App {
             KeyCode::Char('L') => self.toggle_lyrics(),
             KeyCode::Esc => self.msg = None,
 
+            KeyCode::Char('K') | KeyCode::Up
+                if self.view().source == Source::Queue
+                    && (k.code == KeyCode::Char('K')
+                        || k.modifiers.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.move_queue_item(-1)
+            }
+            KeyCode::Char('J') | KeyCode::Down
+                if self.view().source == Source::Queue
+                    && (k.code == KeyCode::Char('J')
+                        || k.modifiers.contains(KeyModifiers::SHIFT)) =>
+            {
+                self.move_queue_item(1)
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('d') if ctrl => self.move_sel(half),
@@ -1507,7 +1756,9 @@ impl App {
                 }
             }
             "login" => self.start_login(),
-            "activate" => self.send("activate", Value::Null),
+            "activate" => {
+                self.send("activate", Value::Null);
+            }
             other => self.error(format!("unknown command: {other}  (try :help)")),
         }
     }
@@ -1525,6 +1776,7 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         let (x, y) = (m.column, m.row);
         match m.kind {
+            MouseEventKind::Moved => self.pointer = Some(Position { x, y }),
             MouseEventKind::Down(btn) => {
                 if self.help {
                     self.help = false;
@@ -1565,6 +1817,7 @@ impl App {
                     Hit::Prev => self.prev(),
                     Hit::Toggle => self.toggle(),
                     Hit::Next => self.next(),
+                    Hit::QueueMove(delta) => self.move_queue_item(delta),
                     Hit::Repeat => self.repeat(None),
                     Hit::Progress => {
                         let f = (x.saturating_sub(r.x)) as f64 / r.width.max(1) as f64;
@@ -1599,5 +1852,62 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_advances_to_the_song_moved_to_the_front() {
+        let (tx, _messages) = tokio::sync::mpsc::unbounded_channel();
+        let (ws, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::new(Config::default()),
+            None,
+            None,
+            reqwest::Client::new(),
+            tx,
+            ws,
+            Picker::halfblocks(),
+        );
+        app.player.connected = true;
+        app.player.logged_in = true;
+        app.player.active = true;
+        app.player.status = "playing".into();
+        let mut current = Item::new(Kind::Track, "spotify:track:current", "Current");
+        current.duration_ms = Some(2_000);
+        app.player.item = Some(current);
+        app.player.pos_ms = 2_000;
+        app.queued = vec![
+            Item::new(Kind::Track, "spotify:track:first", "First"),
+            Item::new(Kind::Track, "spotify:track:second", "Second"),
+        ];
+        app.open_queue();
+        let _ = commands.try_recv().unwrap(); // get_queue
+        app.select(1);
+        app.on_key(KeyCode::Char('K').into());
+        assert_eq!(app.view().sel, 0);
+        assert_eq!(app.view().items[0].name, "Second");
+
+        app.on_tick();
+        let soloist::Request::Send(play) = commands.try_recv().unwrap() else {
+            panic!("expected queue playback");
+        };
+        assert_eq!(play, soloist::command("play", json!({"uri": "spotify:track:second"})));
+        app.on_player_event(json!({
+            "type": "track_changed",
+            "item": {"uri": "spotify:track:second", "entity_type": "track"}
+        }));
+        assert_eq!(app.queued[0].name, "First");
+        assert!(app.queue_start.is_none());
+
+        app.prev();
+        let soloist::Request::Send(play) = commands.try_recv().unwrap() else {
+            panic!("expected playback of the previous song");
+        };
+        assert_eq!(play, soloist::command("play", json!({"uri": "spotify:track:current"})));
+        assert_eq!(app.queued[0].uri, "spotify:track:second");
     }
 }

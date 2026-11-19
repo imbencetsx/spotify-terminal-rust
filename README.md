@@ -33,7 +33,7 @@ soloist -n "str" -k "$SOLOIST_API_KEY" --ws 127.0.0.1:0
 ```
 Pick the device once in any Spotify app to log it in. `str` finds it automatically.
 
-Install with `cargo install --path .`
+Install with `cargo install --path .`. Building on macOS uses the Apple Command Line Tools.
 
 ## Use
 
@@ -67,11 +67,22 @@ Press `/` and type. Results update live. Start the query with a prefix to filter
 | `o` | open the playing album | `+` `-` `m` | volume / mute |
 | `a` | add to queue | `]` `[` | seek ±10s |
 | `Tab` | queue | `H` | library |
+| `K` `J` | move the selected queued song up or down | `Ctrl+C` | quit and stop playback |
 | `P` | play the open album or playlist | `?` | help |
 
 Commands work like vim: `:vol 50`, `:seek 1:23`, `:shuffle on`, `:repeat track`, `:play spotify:album:…`, `:q`.
 
 The mouse works too. Click to select and double-click to play or open. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
+
+### Queue
+
+Press `a` to add a song to the current `str` session. Open the queue with `Tab` and move a song with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. The `↕` marks editable rows. These songs play in order before Spotify’s upcoming tracks. Playing a queued song through Soloist can change the active album or playlist context. Spotify’s own upcoming rows are read-only.
+
+Quitting the player stops a Soloist process it started. If you started Soloist separately, quitting pauses playback on that device and leaves the daemon running.
+
+### macOS Now Playing
+
+The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
 Album art is drawn as text so it fits the terminal. `A` cycles the style, and `art = "…"` in the config sets the default:
 - `pixel` (default): chunky square pixels with a reduced palette.

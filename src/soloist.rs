@@ -47,7 +47,7 @@ pub fn endpoint(cfg: &Config) -> Option<String> {
 pub enum Spawn {
     /// No API key, or it's already running.
     NotNeeded,
-    Started(std::process::Child),
+    Started(tokio::process::Child),
     /// We'd start it, but there's no soloist executable yet.
     Missing,
 }
@@ -103,18 +103,18 @@ pub fn maybe_spawn(cfg: &Config) -> Result<Spawn> {
     let name = cfg.soloist.device_name.as_deref().unwrap_or("str");
     std::fs::create_dir_all(config::cache_dir())?;
     let log = std::fs::File::create(log_path())?;
-    let mut cmd = std::process::Command::new(&bin);
+    let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(["-n", name, "-k", key, "--ws", "127.0.0.1:0"]);
     if let Some(d) = &cfg.soloist.data_dir {
         cmd.arg("-D").arg(d);
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log);
-    // Own process group: keeps playing after str exits, and Ctrl-C doesn't reach it.
+        .stderr(log)
+        .kill_on_drop(true);
+    // The TUI handles Ctrl-C and shuts the child down itself.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
     match cmd.spawn() {
@@ -149,26 +149,35 @@ pub enum Event {
     Up,
     Down(String),
     Msg(Value),
+    PreviousError(String),
+}
+
+pub enum Request {
+    Send(Value),
+    Previous,
 }
 
 /// Keep a connection to Soloist alive forever, forwarding events and commands.
-pub async fn run(cfg: std::sync::Arc<Config>, tx: UnboundedSender<Event>, mut cmds: UnboundedReceiver<Value>) {
+pub async fn run(
+    cfg: std::sync::Arc<Config>,
+    tx: UnboundedSender<Event>,
+    mut cmds: UnboundedReceiver<Request>,
+) {
     let mut last_down = String::new();
     loop {
         let down = match endpoint(&cfg) {
             None => "soloist not running".to_string(),
             Some(addr) => match connect_async(format!("ws://{addr}")).await {
                 Err(e) => format!("can't reach soloist at {addr}: {e}"),
-                Ok((ws, _)) => {
+                Ok((mut ws, _)) => {
                     while cmds.try_recv().is_ok() {} // drop stale commands
                     if tx.send(Event::Up).is_err() {
                         return;
                     }
                     last_down.clear();
-                    let (mut w, mut r) = ws.split();
                     loop {
                         tokio::select! {
-                            m = r.next() => match m {
+                            m = ws.next() => match m {
                                 Some(Ok(Message::Text(t))) => {
                                     if let Ok(v) = serde_json::from_str::<Value>(t.as_str())
                                         && tx.send(Event::Msg(v)).is_err() {
@@ -180,9 +189,17 @@ pub async fn run(cfg: std::sync::Arc<Config>, tx: UnboundedSender<Event>, mut cm
                                 _ => {}
                             },
                             c = cmds.recv() => match c {
-                                Some(v) => if let Err(e) = w.send(Message::text(v.to_string())).await {
+                                Some(Request::Send(v)) => if let Err(e) = ws.send(Message::text(v.to_string())).await {
                                     break format!("soloist connection lost: {e}");
                                 },
+                                Some(Request::Previous) => {
+                                    let result = previous_on(&mut ws, |v| {
+                                        let _ = tx.send(Event::Msg(v.clone()));
+                                    }).await;
+                                    if let Err(e) = result {
+                                        let _ = tx.send(Event::PreviousError(format!("{e:#}")));
+                                    }
+                                }
                                 None => return,
                             },
                         }
@@ -366,7 +383,13 @@ impl Player {
                 Change::Other
             }
             "track_changed" => {
+                let previous_uri = self.item.as_ref().map(|i| i.uri.clone());
                 self.item = entity(&v["item"]);
+                if self.item.as_ref().map(|i| &i.uri) != previous_uri.as_ref() {
+                    self.pos_ms = 0;
+                    self.pos_ts = now_ms();
+                    self.speed = 0.0;
+                }
                 Change::Other
             }
             "playback_changed" => {
@@ -436,19 +459,152 @@ async fn next_json(ws: &mut Ws) -> Result<Value> {
     }
 }
 
-/// Connect, wait for auth, optionally fetch state, send commands, wait for acks.
-pub async fn oneshot(addr: &str, cmds: Vec<Value>, want_state: bool) -> Result<Option<Value>> {
+async fn send(ws: &mut Ws, name: &str, extra: Value) -> Result<()> {
+    ws.send(Message::text(command(name, extra).to_string()))
+        .await?;
+    Ok(())
+}
+
+async fn connect(addr: &str) -> Result<(Ws, Value)> {
     let (mut ws, _) = connect_async(format!("ws://{addr}"))
         .await
         .with_context(|| format!("can't reach soloist at {addr}"))?;
     loop {
         let v = next_json(&mut ws).await?;
         if v["type"] == "auth_state" {
-            if v["logged_in"] != true {
-                bail!("soloist isn't logged in yet — select its device once in a Spotify app");
-            }
-            break;
+            return Ok((ws, v));
         }
+    }
+}
+
+pub async fn previous(addr: &str) -> Result<()> {
+    let (mut ws, auth) = connect(addr).await?;
+    if auth["logged_in"] != true {
+        bail!("soloist isn't logged in yet");
+    }
+    previous_on(&mut ws, |_| {}).await
+}
+
+/// Soloist restarts the current track if it's already well underway. Seek to
+/// the start and wait for the position update before dispatching Previous.
+async fn previous_on(ws: &mut Ws, mut observe: impl FnMut(&Value)) -> Result<()> {
+    let run = async {
+        send(ws, "get_state", Value::Null).await?;
+        let state = loop {
+            let v = next_json(ws).await?;
+            observe(&v);
+            match v["type"].as_str() {
+                Some("playback_state") => break v,
+                Some("error") => bail!(
+                    "{}",
+                    v["message"]
+                        .as_str()
+                        .unwrap_or("couldn't get playback state")
+                ),
+                _ => {}
+            }
+        };
+        let mut player = Player::default();
+        player.apply(&state);
+        if player.position() > 1_000 {
+            send(ws, "seek", json!({ "position_ms": 0 })).await?;
+            loop {
+                let v = next_json(ws).await?;
+                observe(&v);
+                match v["type"].as_str() {
+                    Some("position_sync" | "playback_state")
+                        if v["position"]["position_ms"]
+                            .as_u64()
+                            .is_some_and(|ms| ms < 1_000) =>
+                    {
+                        break;
+                    }
+                    Some("error") => bail!("{}", v["message"].as_str().unwrap_or("couldn't seek")),
+                    Some("track_changed") if v["item"]["uri"] != state["item"]["uri"] => {
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        send(ws, "skip_prev", Value::Null).await?;
+        loop {
+            let v = next_json(ws).await?;
+            observe(&v);
+            match v["type"].as_str() {
+                Some("command_result") if v["command"] == "skip_prev" => return Ok(()),
+                Some("error") => bail!("{}", v["message"].as_str().unwrap_or("couldn't skip back")),
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .context("timed out skipping back")?
+}
+
+pub async fn pause_for_exit(addr: &str) -> Result<()> {
+    let (mut ws, auth) = connect(addr).await?;
+    if auth["logged_in"] != true || auth["is_active"] != true {
+        return Ok(());
+    }
+    let already_stopped =
+        |v: &Value| matches!(v["status"].as_str(), Some("paused" | "idle" | "stopped"));
+    // Logged-in connections receive a playback snapshot immediately after auth.
+    let initial = next_json(&mut ws).await?;
+    if initial["type"] == "playback_state" && already_stopped(&initial) {
+        return Ok(());
+    }
+    send(&mut ws, "pause", Value::Null).await?;
+    let mut accepted = false;
+    let mut stopped = false;
+    while !(accepted && stopped) {
+        let v = next_json(&mut ws).await?;
+        match v["type"].as_str() {
+            Some("command_result") if v["command"] == "pause" => {
+                accepted = true;
+                if !stopped {
+                    send(&mut ws, "get_state", Value::Null).await?;
+                }
+            }
+            Some("playback_state" | "playback_changed") => {
+                stopped = already_stopped(&v);
+            }
+            Some("error") => bail!(
+                "{}",
+                v["message"].as_str().unwrap_or("couldn't stop playback")
+            ),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn shutdown_child(mut child: tokio::process::Child) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            status?;
+            return Ok(());
+        }
+    }
+    child.kill().await?;
+    Ok(())
+}
+
+/// Connect, wait for auth, optionally fetch state, send commands, wait for acks.
+pub async fn oneshot(addr: &str, cmds: Vec<Value>, want_state: bool) -> Result<Option<Value>> {
+    let (mut ws, auth) = connect(addr).await?;
+    if auth["logged_in"] != true {
+        bail!("soloist isn't logged in yet — select its device once in a Spotify app");
     }
     let mut state = None;
     if want_state {
@@ -512,6 +668,61 @@ mod tests {
         let c = command("seek", json!({"position_ms": 5}));
         assert_eq!(c, json!({"type":"command","command":"seek","position_ms":5}));
         assert_eq!(command("pause", Value::Null), json!({"type":"command","command":"pause"}));
+    }
+
+    #[tokio::test]
+    async fn previous_waits_for_the_seek_to_land() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let read = |m: Message| serde_json::from_str::<Value>(m.to_text().unwrap()).unwrap();
+            let message = |v: Value| Message::text(v.to_string());
+            ws.send(message(json!({"type": "auth_state", "logged_in": true})))
+                .await
+                .unwrap();
+            assert_eq!(
+                read(ws.next().await.unwrap().unwrap())["command"],
+                "get_state"
+            );
+            ws.send(message(json!({
+                "type": "playback_state", "status": "playing",
+                "position": {"position_ms": 20_000}
+            })))
+            .await
+            .unwrap();
+            assert_eq!(
+                read(ws.next().await.unwrap().unwrap()),
+                command("seek", json!({"position_ms": 0}))
+            );
+            ws.send(message(
+                json!({"type": "command_result", "command": "seek"}),
+            ))
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), ws.next())
+                    .await
+                    .is_err()
+            );
+            ws.send(message(
+                json!({"type": "position_sync", "position": {"position_ms": 0}}),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(
+                read(ws.next().await.unwrap().unwrap())["command"],
+                "skip_prev"
+            );
+            ws.send(message(
+                json!({"type": "command_result", "command": "skip_prev"}),
+            ))
+            .await
+            .unwrap();
+        });
+        previous(&addr.to_string()).await.unwrap();
+        server.await.unwrap();
     }
 
     #[test]
