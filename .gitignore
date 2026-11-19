@@ -1,0 +1,24 @@
+/target
+
+# never commit credentials: str keeps them in ~/.config/str, but in case a
+# copy lands in the repo while testing
+config.toml
+token.json
+.env
+.env.*
+*.pem
+*.key
+
+# Soloist downloads and runtime files
+soloist
+soloist.exe
+soloist_release_*
+ws.addr
+ws.port
+soloist.pid
+
+# editor / OS clutter
+.DS_Store
+*.swp
+.idea/
+.vscode/
