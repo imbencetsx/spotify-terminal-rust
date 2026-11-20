@@ -9,8 +9,9 @@ use crossterm::event::{
 };
 use image::DynamicImage;
 use ratatui::layout::{Position, Rect};
-use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::Resize;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::{Protocol, StatefulProtocol};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -239,6 +240,11 @@ pub struct Art {
     pub proto: StatefulProtocol,
 }
 
+pub enum Thumbnail {
+    Bitmap(Protocol),
+    Text(crate::art::Rendered),
+}
+
 pub struct App {
     pub cfg: Arc<Config>,
     pub api: Option<Api>,
@@ -256,6 +262,8 @@ pub struct App {
     manual_advance: Option<Instant>,
     pub soloist_child: Option<tokio::process::Child>,
     pub views: Vec<View>,
+    home_items: Vec<Item>,
+    playlist_pins: Vec<Item>,
     pub mode: Mode,
     pub query: Input,
     pub cmd: Input,
@@ -280,6 +288,7 @@ pub struct App {
     /// Graphics-protocol state per slot (only in `art = image` mode).
     pub protos: [Option<Art>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
+    thumbnails: HashMap<(String, u16, u16), Thumbnail>,
     pub hits: Vec<(Rect, Hit)>,
     pub pointer: Option<Position>,
     pub list_height: usize,
@@ -333,6 +342,8 @@ impl App {
             manual_advance: None,
             soloist_child: None,
             views: Vec::new(),
+            home_items: Vec::new(),
+            playlist_pins: Vec::new(),
             mode: Mode::Normal,
             query: Input::default(),
             cmd: Input::default(),
@@ -352,6 +363,7 @@ impl App {
             shown: [None, None],
             protos: [None, None],
             art_cache: HashMap::new(),
+            thumbnails: HashMap::new(),
             hits: Vec::new(),
             pointer: None,
             list_height: 20,
@@ -370,6 +382,10 @@ impl App {
             muted_from: None,
             next_id: 1,
         };
+        match crate::config::load_playlist_pins() {
+            Ok(pins) => app.playlist_pins = pins,
+            Err(e) => app.error(format!("{e:#}")),
+        }
         app.go_home();
         app
     }
@@ -443,8 +459,88 @@ impl App {
     }
 
     pub fn go_home(&mut self) {
-        let v = self.new_view("Playlists", Source::Home);
+        let mut v = self.new_view("Playlists", Source::Home);
+        self.home_items.clear();
+        v.items = self.playlist_pins.clone();
         self.replace_root(v);
+    }
+
+    pub fn playlist_pinned(&self, uri: &str) -> bool {
+        self.playlist_pins.iter().any(|item| item.uri == uri)
+    }
+
+    fn refresh_home_pins(&mut self) {
+        let items = self
+            .playlist_pins
+            .iter()
+            .map(|pin| {
+                self.home_items
+                    .iter()
+                    .find(|item| item.uri == pin.uri)
+                    .unwrap_or(pin)
+            })
+            .chain(
+                self.home_items
+                    .iter()
+                    .filter(|item| !self.playlist_pinned(&item.uri)),
+            )
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(view) = self
+            .views
+            .iter_mut()
+            .find(|view| view.source == Source::Home)
+        {
+            let selected = view
+                .selected()
+                .and_then(|item| items.iter().position(|i| i.uri == item.uri));
+            view.items = items;
+            view.sel = selected.unwrap_or(0);
+        }
+    }
+
+    fn pin_playlist(&mut self, pin: Option<bool>) {
+        let Some(item) = self
+            .view()
+            .header
+            .as_ref()
+            .filter(|item| item.kind == Kind::Playlist)
+            .or_else(|| {
+                self.view()
+                    .selected()
+                    .filter(|item| item.kind == Kind::Playlist)
+            })
+            .cloned()
+        else {
+            self.info("Select or open a playlist to pin it");
+            return;
+        };
+        let result = (|| {
+            let mut pins = crate::config::load_playlist_pins()?;
+            let index = pins.iter().position(|p| p.uri == item.uri);
+            let pinned = pin.unwrap_or(index.is_none());
+            let name = item.name.clone();
+            match (pinned, index) {
+                (true, None) => pins.push(item),
+                (false, Some(i)) => {
+                    pins.remove(i);
+                }
+                _ => {}
+            }
+            crate::config::save_playlist_pins(&pins)?;
+            Ok::<_, anyhow::Error>((pins, pinned, name))
+        })();
+        match result {
+            Ok((pins, pinned, name)) => {
+                self.playlist_pins = pins;
+                self.refresh_home_pins();
+                self.info(format!(
+                    "{} {name}",
+                    if pinned { "Pinned" } else { "Unpinned" }
+                ));
+            }
+            Err(e) => self.error(format!("Couldn’t save playlist pins: {e:#}")),
+        }
     }
 
     fn open_queue(&mut self) {
@@ -1162,6 +1258,19 @@ impl App {
                     }
                     Ok(p) => {
                         let p = *p;
+                        if v.source == Source::Home {
+                            v.next = p.next;
+                            if offset == 0 {
+                                self.home_items = p.items;
+                            } else {
+                                self.home_items.extend(p.items);
+                            }
+                            self.refresh_home_pins();
+                            if is_top {
+                                self.maybe_load_more();
+                            }
+                            return;
+                        }
                         if offset == 0 {
                             v.items = p.items;
                             v.sel = 0;
@@ -1317,6 +1426,11 @@ impl App {
             .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
         if track_changed {
             self.manual_advance = None;
+            self.lyrics_manual = None;
+            for view in self.views.iter_mut().filter(|v| v.source == Source::Lyrics) {
+                view.sel = 0;
+                view.scroll = 0;
+            }
         }
         if finishing
             && (track_changed || matches!(self.player.status.as_str(), "idle" | "stopped"))
@@ -1383,12 +1497,14 @@ impl App {
         }
     }
 
-    /// Fetch lyrics for the playing song once (call before drawing).
+    /// Look up the current track for the player preview and lyrics page.
     pub fn sync_lyrics(&mut self) {
-        if self.cfg.lyrics == Some(false) {
+        if !self.lyrics_enabled() {
             return;
         }
-        let Some(it) = self.player.item.as_ref().filter(|i| i.kind == Kind::Track && !i.uri.is_empty()) else {
+        let Some(it) = self.player.item.as_ref().filter(|i| {
+            i.kind == Kind::Track && !i.uri.is_empty() && !i.name.is_empty() && !i.sub.is_empty()
+        }) else {
             return;
         };
         if self.lyrics.contains_key(&it.uri) {
@@ -1397,9 +1513,15 @@ impl App {
         if self.lyrics.len() >= 64 {
             self.lyrics.clear();
         }
-        let (uri, name, artist, album) = (it.uri.clone(), it.name.clone(), it.sub.clone(), it.extra.clone());
-        let dur = it.duration_ms.unwrap_or_else(|| self.player.duration());
-        self.lyrics.insert(uri.clone(), crate::lyrics::State::Loading);
+        let (uri, name, artist, album) = (
+            it.uri.clone(),
+            it.name.clone(),
+            it.sub.clone(),
+            it.extra.clone(),
+        );
+        let dur = it.duration_ms.unwrap_or_default();
+        self.lyrics
+            .insert(uri.clone(), crate::lyrics::State::Loading);
         let (http, tx) = (self.http.clone(), self.tx.clone());
         tokio::spawn(async move {
             let state = crate::lyrics::fetch(&http, &name, &artist, &album, dur)
@@ -1409,8 +1531,15 @@ impl App {
         });
     }
 
+    pub fn lyrics_enabled(&self) -> bool {
+        self.cfg.lyrics != Some(false)
+    }
+
     /// Lyrics state of the playing song (None: nothing playing / turned off).
     pub fn lyrics_state(&self) -> Option<&crate::lyrics::State> {
+        if !self.lyrics_enabled() {
+            return None;
+        }
         self.lyrics.get(&self.player.item.as_ref()?.uri)
     }
 
@@ -1427,7 +1556,7 @@ impl App {
             self.back();
             return;
         }
-        if self.cfg.lyrics == Some(false) {
+        if !self.lyrics_enabled() {
             self.info("lyrics are off: set lyrics = true in the config");
             return;
         }
@@ -1443,8 +1572,26 @@ impl App {
         self.lyrics_manual = None;
     }
 
+    pub fn sync_lyrics_selection(&mut self, current: Option<usize>, synced: bool) {
+        if synced
+            && self
+                .lyrics_manual
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(5))
+        {
+            self.lyrics_manual = None;
+        }
+        if self.lyrics_manual.is_none() {
+            self.view_mut().sel = current.unwrap_or_default();
+        }
+    }
+
     fn seek_to_line(&mut self, i: usize) {
-        let Some(at) = self.current_lyrics().filter(|l| l.synced).and_then(|l| l.lines.get(i)).map(|l| l.at_ms) else {
+        let Some(at) = self
+            .current_lyrics()
+            .filter(|l| l.synced)
+            .and_then(|l| l.lines.get(i))
+            .map(|l| l.at_ms)
+        else {
             return;
         };
         self.seek(at as i64);
@@ -1505,6 +1652,33 @@ impl App {
             self.art_cache.insert(key.clone(), r);
         }
         self.art_cache.get(&key)
+    }
+
+    pub fn thumbnail(&mut self, url: &str, w: u16, h: u16) -> Option<&Thumbnail> {
+        let key = (url.to_owned(), w, h);
+        if !self.thumbnails.contains_key(&key) {
+            let image = self.images.get(url)?;
+            let bitmap = (self.picker.protocol_type() != ProtocolType::Halfblocks)
+                .then(|| {
+                    let font = self.picker.font_size();
+                    let image = image.resize_exact(
+                        u32::from(w) * u32::from(font.width),
+                        u32::from(h) * u32::from(font.height),
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    self.picker.new_protocol(image, (w, h).into(), Resize::default()).ok()
+                })
+                .flatten();
+            let thumb = bitmap.map_or_else(
+                || Thumbnail::Text(crate::art::render_thumbnail(image, w, h)),
+                Thumbnail::Bitmap,
+            );
+            if self.thumbnails.len() >= 160 {
+                self.thumbnails.clear();
+            }
+            self.thumbnails.insert(key.clone(), thumb);
+        }
+        self.thumbnails.get(&key)
     }
 
     pub fn cycle_art(&mut self) {
@@ -1621,6 +1795,7 @@ impl App {
             KeyCode::Char('S') => self.open_setup(),
             KeyCode::Char('A') => self.cycle_art(),
             KeyCode::Char('L') => self.toggle_lyrics(),
+            KeyCode::Esc if self.view().source == Source::Lyrics => self.back(),
             KeyCode::Esc => self.msg = None,
 
             KeyCode::Char('K') | KeyCode::Up
@@ -1772,6 +1947,8 @@ impl App {
             }
             "queue" | "qu" => self.open_queue(),
             "lyrics" | "ly" | "lyr" => self.toggle_lyrics(),
+            "pin" => self.pin_playlist(None),
+            "unpin" => self.pin_playlist(Some(false)),
             "add" => self.enqueue_selected(),
             "home" | "lib" | "library" | "playlists" | "lists" => self.go_home_clear(),
             "open" => self.open_now_playing(),
@@ -1886,7 +2063,7 @@ impl App {
                     Hit::PlayHeader => self.play_header(),
                     Hit::Lyrics => self.toggle_lyrics(),
                     Hit::LyricLine(i) => {
-                        self.view_mut().sel = i;
+                        self.select(i);
                         self.seek_to_line(i);
                     }
                     Hit::OpenSetup => self.open_setup(),
@@ -1927,6 +2104,20 @@ mod tests {
         app.player.logged_in = true;
         app.player.active = true;
         (app, commands)
+    }
+
+    #[test]
+    fn bitmap_thumbnail_fits_the_unchanged_slot() {
+        let (mut app, _) = connected_app();
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(8, 16));
+        picker.set_protocol_type(ProtocolType::Kitty);
+        app.picker = picker;
+        app.images.insert("cover".into(), DynamicImage::new_rgb8(64, 64));
+        let Some(Thumbnail::Bitmap(image)) = app.thumbnail("cover", 4, 2) else {
+            panic!("expected terminal graphics for the thumbnail");
+        };
+        assert_eq!(image.size(), (4, 2).into());
     }
 
     #[test]

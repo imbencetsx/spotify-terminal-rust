@@ -1,5 +1,4 @@
-//! Album art drawn with text: chunky pixel art (half blocks) or a dot matrix.
-//! Fits the terminal look better than a photo, and works in every terminal.
+//! Album art drawn with full-color half blocks or a dot matrix.
 
 use image::DynamicImage;
 use image::imageops::FilterType;
@@ -9,7 +8,7 @@ use ratatui::style::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Style {
-    /// Square pixels (half blocks) at full cell resolution, lightly posterized.
+    /// Full-color half blocks at terminal resolution.
     Pixel,
     /// A dot matrix: dot size follows brightness, dot colour follows the art.
     Dots,
@@ -60,7 +59,7 @@ impl Rendered {
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
         for y in 0..self.h.min(area.height) {
             for x in 0..self.w.min(area.width) {
-                let c = self.cells[(y * self.w + x) as usize];
+                let c = self.cells[y as usize * self.w as usize + x as usize];
                 if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
                     cell.set_char(c.ch).set_fg(c.fg);
                     if let Some(bg) = c.bg {
@@ -72,42 +71,26 @@ impl Rendered {
     }
 }
 
-/// Snap a channel to a few levels: gives the retro, reduced-palette look.
-fn posterize(v: u8) -> u8 {
-    const LEVELS: f32 = 14.0;
-    ((v as f32 / 255.0 * LEVELS).round() / LEVELS * 255.0) as u8
-}
-
-fn rgb(p: image::Rgb<u8>, poster: bool) -> Color {
-    let f = |v| if poster { posterize(v) } else { v };
-    Color::Rgb(f(p[0]), f(p[1]), f(p[2]))
+fn rgb(p: &image::Rgb<u8>) -> Color {
+    Color::Rgb(p[0], p[1], p[2])
 }
 
 /// Render `img` into `w`×`h` cells.
 pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
     let (w32, h32) = (w as u32, h as u32);
-    let mut cells = Vec::with_capacity((w * h) as usize);
+    let mut cells = Vec::with_capacity(w as usize * h as usize);
+    if w == 0 || h == 0 {
+        return Rendered { w, h, cells };
+    }
     match style {
         Style::Pixel | Style::Image => {
-            // Each art pixel is k columns × k half-rows (= square on a 1:2 font).
-            // k grows only for very large covers, so art stays crisp but pixel-y.
-            let k = w32.div_ceil(72).max(1);
-            let (pw, ph) = ((w32 / k).max(1), ((h32 * 2) / k).max(1));
-            let small = img.resize_exact(pw, ph, FilterType::Triangle).to_rgb8();
-            // centre the grid when the area isn't a multiple of k
-            let (ox, oy) = ((w32 - (pw * k).min(w32)) / 2, (h32 * 2 - (ph * k).min(h32 * 2)) / 2);
-            let px = |x: u32, hy: u32| -> Option<Color> {
-                let (x, hy) = (x.checked_sub(ox)? / k, hy.checked_sub(oy)? / k);
-                (x < pw && hy < ph).then(|| rgb(*small.get_pixel(x, hy), true))
-            };
+            let small = img.resize_exact(w32, h32 * 2, FilterType::Lanczos3).to_rgb8();
             for y in 0..h32 {
                 for x in 0..w32 {
-                    let (top, bot) = (px(x, y * 2), px(x, y * 2 + 1));
-                    cells.push(match (top, bot) {
-                        (Some(t), Some(b)) => Cell { ch: '▀', fg: t, bg: Some(b) },
-                        (Some(t), None) => Cell { ch: '▀', fg: t, bg: None },
-                        (None, Some(b)) => Cell { ch: '▄', fg: b, bg: None },
-                        (None, None) => Cell { ch: ' ', fg: Color::Reset, bg: None },
+                    cells.push(Cell {
+                        ch: '▀',
+                        fg: rgb(small.get_pixel(x, y * 2)),
+                        bg: Some(rgb(small.get_pixel(x, y * 2 + 1))),
                     });
                 }
             }
@@ -137,6 +120,60 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
         }
     }
     Rendered { w, h, cells }
+}
+
+/// Use four color samples per cell when the terminal can't draw bitmap images.
+pub fn render_thumbnail(img: &DynamicImage, w: u16, h: u16) -> Rendered {
+    let mut cells = Vec::with_capacity(w as usize * h as usize);
+    if w > 0 && h > 0 {
+        let small = img.resize_exact(u32::from(w) * 2, u32::from(h) * 2, FilterType::Lanczos3).to_rgb8();
+        for y in (0..small.height()).step_by(2) {
+            for x in (0..small.width()).step_by(2) {
+                let samples = [
+                    small.get_pixel(x, y).0,
+                    small.get_pixel(x + 1, y).0,
+                    small.get_pixel(x, y + 1).0,
+                    small.get_pixel(x + 1, y + 1).0,
+                ];
+                cells.push(quadrants(samples));
+            }
+        }
+    }
+    Rendered { w, h, cells }
+}
+
+fn quadrants(samples: [[u8; 3]; 4]) -> Cell {
+    // Each mask and its inverse represent the same split of foreground and background.
+    // Keep the split with the least RGB error.
+    const GLYPHS: [char; 8] = [' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛'];
+    let mut best = (u32::MAX, ' ', [[0; 3]; 2]);
+    for (mask, ch) in GLYPHS.into_iter().enumerate() {
+        let mut sums = [[0u16; 3]; 2];
+        let mut counts = [0u16; 2];
+        for (i, sample) in samples.iter().enumerate() {
+            let group = (mask >> i) & 1;
+            counts[group] += 1;
+            for (sum, value) in sums[group].iter_mut().zip(sample) {
+                *sum += u16::from(*value);
+            }
+        }
+        let mut colors = [[0u8; 3]; 2];
+        for group in 0..2 {
+            colors[group] = sums[group].map(|sum| (sum / counts[group].max(1)) as u8);
+        }
+        let mut error = 0;
+        for (i, sample) in samples.iter().enumerate() {
+            for (&value, mean) in sample.iter().zip(colors[(mask >> i) & 1]) {
+                let difference = u32::from(value.abs_diff(mean));
+                error += difference * difference;
+            }
+        }
+        if error < best.0 {
+            best = (error, ch, colors);
+        }
+    }
+    let (_, ch, [[r, g, b], [fr, fg, fb]]) = best;
+    Cell { ch, fg: Color::Rgb(fr, fg, fb), bg: Some(Color::Rgb(r, g, b)) }
 }
 
 fn hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -305,6 +342,20 @@ mod tests {
         let mid = 10 * 40;
         assert!(matches!(r.cells[mid + 2].fg, Color::Rgb(255, 0, 0)));
         assert!(matches!(r.cells[mid + 37].fg, Color::Rgb(0, 0, 255)));
+    }
+
+    #[test]
+    fn tiny_cover_keeps_horizontal_detail_in_one_cell() {
+        let red = image::Rgb([255, 0, 0]);
+        let blue = image::Rgb([0, 0, 255]);
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 2, |x, _| {
+            if x == 0 { red } else { blue }
+        }));
+        let thumbnail = render_thumbnail(&img, 1, 1);
+        assert_eq!(
+            thumbnail.cells,
+            [Cell { ch: '▌', fg: rgb(&red), bg: Some(rgb(&blue)) }],
+        );
     }
 
     #[test]

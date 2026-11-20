@@ -1,8 +1,9 @@
 //! Rendering. Everything is drawn from `App` each frame; clickable regions are
 //! recorded into `app.hits` as we go.
 
-use crate::app::{App, Hit, Mode, SETUP_LABELS, Setup, SetupStage, View};
+use crate::app::{App, Hit, Mode, SETUP_LABELS, Setup, SetupStage, Thumbnail, View};
 use crate::art::{BgMode as ArtBg, Style as ArtStyle};
+use crate::lyrics;
 use crate::model::{Item, Kind, Source, fmt_ms, parse_query};
 use crate::soloist::Repeat;
 use image::imageops::FilterType;
@@ -322,9 +323,16 @@ fn player(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
     let mut y = inner.y;
 
     if full {
-        // cover gets whatever is left after the info block (12 rows)
-        // room for the shadow (1 col right, 1 row below) and a blank line under it
-        let (cw, ch) = square(app, inner.width.saturating_sub(1), inner.height.saturating_sub(14));
+        // Leave room for the shadow, controls and the wrapped lyrics preview.
+        let reserved = if app.lyrics_enabled() {
+            let preview_rows = lyrics_preview_lines(app).iter().fold(0u16, |rows, text| {
+                rows.saturating_add(lyric_preview_rows(*text, inner.width))
+            });
+            13u16.saturating_add(preview_rows.max(4))
+        } else {
+            14
+        };
+        let (cw, ch) = square(app, inner.width.saturating_sub(1), inner.height.saturating_sub(reserved));
         if ch >= 4 {
             let r = Rect::new(inner.x + (inner.width - cw - 1) / 2, y, cw, ch);
             cover(f, app, r, 0);
@@ -363,7 +371,12 @@ fn player(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
         controls(f, app, row(y), &pal);
         y += 2;
         volume(f, app, row(y), &pal);
-
+        if app.lyrics_enabled() && y + 2 < inner.bottom() {
+            lyrics_button(f, app, row(y + 2), &pal);
+            let preview_y = y + 3;
+            let preview = Rect::new(inner.x, preview_y, inner.width, inner.bottom().saturating_sub(preview_y));
+            lyrics_preview(f, app, preview, &pal);
+        }
     } else {
         // compact: title · artist / progress / controls + volume
         let line = match &p.item {
@@ -373,13 +386,101 @@ fn player(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
             ]),
             None => Line::styled("nothing playing", Style::new().fg(pal.dim(y))),
         };
-        f.render_widget(line, row(y));
+        let title_width = if app.lyrics_enabled() && inner.width >= 28 {
+            inner.width - 12
+        } else {
+            inner.width
+        };
+        f.render_widget(line, Rect::new(inner.x, y, title_width, 1));
+        if title_width < inner.width {
+            lyrics_button(f, app, Rect::new(inner.x + title_width, y, 12, 1), &pal);
+        }
         if inner.height >= 3 {
             progress(f, app, row(y + 1), &pal);
             controls(f, app, row(y + 2), &pal);
         } else {
             controls(f, app, row(y + 1), &pal);
         }
+    }
+}
+
+fn lyrics_button(f: &mut Frame, app: &mut App, r: Rect, pal: &Pal) {
+    let label = " Lyrics L ";
+    let width = sw(label);
+    let x = r.x + r.width.saturating_sub(width) / 2;
+    let active = app.view().source == Source::Lyrics;
+    let style = if active {
+        Style::new().fg(on_accent()).bg(accent()).bold()
+    } else {
+        Style::new().fg(pal.muted(r.y))
+    };
+    span_at(f, x, r.y, Span::styled(label, style));
+    app.hits.push((Rect::new(x, r.y, width, 1), Hit::Lyrics));
+}
+
+fn lyrics_preview_lines(app: &App) -> [Option<&str>; 4] {
+    let mut preview = [None; 4];
+    match app.lyrics_state() {
+        Some(lyrics::State::Ready(lyrics)) if lyrics.synced => {
+            let current = lyrics.current(app.player.position());
+            let next = current.map_or(0, |i| i + 1);
+            if let Some(i) = current {
+                preview[0] = lyrics.lines[..i]
+                    .iter()
+                    .rev()
+                    .find(|line| !line.text.is_empty())
+                    .map(|line| line.text.as_str());
+                preview[1] = Some(lyrics.lines[i].text.as_str());
+            }
+            for (slot, line) in preview[2..].iter_mut().zip(
+                lyrics.lines[next..]
+                    .iter()
+                    .filter(|line| !line.text.is_empty()),
+            ) {
+                *slot = Some(line.text.as_str());
+            }
+        }
+        Some(lyrics::State::Loading) => preview[0] = Some("Loading lyrics…"),
+        Some(lyrics::State::Ready(_)) => preview[0] = Some("Open Lyrics to read"),
+        Some(lyrics::State::Failed(_)) => preview[0] = Some("Open Lyrics to retry"),
+        _ => {}
+    }
+    preview
+}
+
+fn lyric_preview_paragraph(text: &str) -> Paragraph<'_> {
+    Paragraph::new(text).alignment(Alignment::Center).wrap(Wrap { trim: true })
+}
+
+fn lyric_preview_rows(text: Option<&str>, width: u16) -> u16 {
+    text.map_or(1, |text| {
+        lyric_preview_paragraph(text).line_count(width).clamp(1, u16::MAX as usize) as u16
+    })
+}
+
+fn lyrics_preview(f: &mut Frame, app: &mut App, area: Rect, pal: &Pal) {
+    let mut y = area.y;
+    let mut has_text = false;
+    for (i, text) in lyrics_preview_lines(app).into_iter().enumerate() {
+        if y >= area.bottom() {
+            break;
+        }
+        let height = lyric_preview_rows(text, area.width).min(area.bottom() - y);
+        let row = Rect::new(area.x, y, area.width, height);
+        y += height;
+        let Some(text) = text else { continue };
+        let y = row.y;
+        let style = match i {
+            1 => Style::new().fg(pal.text(y)).bold(),
+            2 => Style::new().fg(pal.fg(y, 0.58, MUTED)),
+            3 => Style::new().fg(pal.fg(y, 0.44, DIM)),
+            _ => Style::new().fg(pal.fg(y, 0.35, Color::Rgb(92, 92, 92))),
+        };
+        f.render_widget(lyric_preview_paragraph(text).style(style), row);
+        has_text = true;
+    }
+    if has_text {
+        app.hits.push((Rect::new(area.x, area.y, area.width, y - area.y), Hit::Lyrics));
     }
 }
 
@@ -479,11 +580,122 @@ fn list(f: &mut Frame, app: &mut App, area: Rect) {
 
     // your playlists: a full page of covers; everything else: header + rows
     let v = app.view();
-    if v.source == Source::Home && !v.items.is_empty() {
+    if v.source == Source::Lyrics {
+        lyrics_page(f, app, body);
+    } else if v.source == Source::Home && !v.items.is_empty() {
         playlists_grid(f, app, body);
     } else {
         pane(f, app, body);
     }
+}
+
+fn lyrics_page(f: &mut Frame, app: &mut App, area: Rect) {
+    let (message, style) = match app.lyrics_state() {
+        Some(lyrics::State::Ready(_)) => ("", Style::new()),
+        Some(lyrics::State::Loading) => ("Loading lyrics…", Style::new().fg(MUTED)),
+        Some(lyrics::State::Instrumental) => ("Instrumental track", Style::new().fg(MUTED)),
+        Some(lyrics::State::Missing) => ("No lyrics found for this track", Style::new().fg(MUTED)),
+        Some(lyrics::State::Failed(error)) => {
+            let content = format!("Couldn’t load lyrics. Reopen Lyrics to retry.\n{error}");
+            f.render_widget(
+                Paragraph::new(content)
+                    .style(Style::new().fg(RED))
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        None => {
+            let message = match app.player.item.as_ref().map(|i| i.kind) {
+                None => "Play a song to see its lyrics",
+                Some(Kind::Track) => "Waiting for track details…",
+                _ => "Lyrics are available for songs",
+            };
+            (message, Style::new().fg(MUTED))
+        }
+    };
+    let Some(lyrics) = app.current_lyrics() else {
+        f.render_widget(Line::styled(message, style), area);
+        return;
+    };
+    let synced = lyrics.synced;
+    let current = lyrics.current(app.player.position());
+    app.sync_lyrics_selection(current, synced);
+    let selected = app.view().sel;
+    let manual = app.lyrics_manual.is_some();
+    let hint = match (synced, manual) {
+        (true, true) => "Following paused  ·  Enter or click to seek",
+        (true, false) => "Synced  ·  Enter or click to seek",
+        (false, _) => "Unsynced  ·  j/k or scroll to read",
+    };
+    f.render_widget(
+        Line::styled(hint, Style::new().fg(DIM)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let area = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width.min(86),
+        area.height.saturating_sub(1),
+    );
+    if area.height == 0 {
+        return;
+    }
+    app.list_height = area.height as usize;
+    let Some(lyrics) = app.current_lyrics() else {
+        return;
+    };
+    let gutter = if synced { 8 } else { 2 };
+    let text_width = area.width.saturating_sub(gutter);
+    let paragraph = |i: usize| {
+        let style = if current == Some(i) {
+            Style::new().fg(accent()).bold()
+        } else {
+            Style::new().fg(if manual && i == selected { FG } else { MUTED })
+        };
+        Paragraph::new(lyrics.lines[i].text.as_str())
+            .style(style)
+            .wrap(Wrap { trim: true })
+    };
+    // Keep the active line near the middle and account for wrapped lines.
+    let mut first = selected;
+    let mut above = 0;
+    while first > 0 {
+        let height = paragraph(first - 1).line_count(text_width).max(1);
+        if above + height > area.height as usize / 2 {
+            break;
+        }
+        first -= 1;
+        above += height;
+    }
+    let mut y = area.y;
+    let mut hits = Vec::new();
+    for (i, line) in lyrics.lines.iter().enumerate().skip(first) {
+        let text = paragraph(i);
+        let height = text
+            .line_count(text_width)
+            .max(1)
+            .min((area.bottom() - y) as usize) as u16;
+        let row = Rect::new(area.x, y, area.width, height);
+        let cursor = current == Some(i) || (manual && i == selected);
+        if cursor {
+            f.render_widget(Block::new().style(Style::new().bg(SEL_BG)), row);
+            span_at(f, row.x, y, Span::styled("▎", Style::new().fg(accent())));
+        }
+        if synced {
+            f.render_widget(
+                Line::styled(fmt_ms(line.at_ms), Style::new().fg(DIM)),
+                Rect::new(row.x + 2, y, gutter - 3, 1),
+            );
+        }
+        f.render_widget(text, Rect::new(row.x + gutter, y, text_width, height));
+        hits.push((row, Hit::LyricLine(i)));
+        y += height;
+        if y == area.bottom() {
+            break;
+        }
+    }
+    app.hits.extend(hits);
 }
 
 /// Breadcrumbs + item count. Returns the y where content starts.
@@ -647,7 +859,7 @@ fn kind_label(it: &Item) -> &'static str {
     }
 }
 
-/// A small pixel-art thumbnail (fetched on demand).
+/// A small cover thumbnail (fetched on demand).
 fn thumb(f: &mut Frame, app: &mut App, r: Rect, it: &Item) {
     if it.kind == Kind::Liked {
         liked_cover(f, r);
@@ -657,8 +869,9 @@ fn thumb(f: &mut Frame, app: &mut App, r: Rect, it: &Item) {
         f.render_widget(Block::new().style(Style::new().bg(Color::Rgb(38, 38, 38))), r);
         return;
     };
-    match app.rendered_art(&url, r.width, r.height) {
-        Some(art) => art.draw(r, f.buffer_mut()),
+    match app.thumbnail(&url, r.width, r.height) {
+        Some(Thumbnail::Bitmap(image)) => f.render_widget(ratatui_image::Image::new(image), r),
+        Some(Thumbnail::Text(art)) => art.draw(r, f.buffer_mut()),
         None => {
             app.fetch_image(url);
             f.render_widget(Block::new().style(Style::new().bg(Color::Rgb(38, 38, 38))), r);
@@ -670,7 +883,7 @@ fn thumb(f: &mut Frame, app: &mut App, r: Rect, it: &Item) {
 fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
     const RH: u16 = 2; // text rows per item
     const STEP: u16 = RH + 1; // + one blank line between items
-    const TW: u16 = 4; // thumbnail: 4 cols × 2 rows = a square of 4×4 pixels
+    const TW: u16 = 4; // thumbnail width in terminal cells
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
     let per = ((body.height + 1) / STEP).max(1) as usize;
     app.list_height = per;
@@ -924,9 +1137,16 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
             Line::from(vec![Span::styled(mark, mark_st), Span::styled(trunc(&it.name, name_w), name_st)]),
             Rect::new(x, y + cover_h, cw, 1),
         );
-        let sub = if it.extra.is_empty() { "Playlist".to_string() } else { it.extra.clone() };
+        let sub = if it.extra.is_empty() { "Playlist" } else { &it.extra };
+        let pin = if app.playlist_pinned(&it.uri) { "★ " } else { "" };
         f.render_widget(
-            Line::styled(trunc(&sub, cw as usize), Style::new().fg(if is_sel { MUTED } else { DIM })),
+            Line::from(vec![
+                Span::styled(pin, Style::new().fg(accent())),
+                Span::styled(
+                    trunc(sub, (cw as usize).saturating_sub(pin.width())),
+                    Style::new().fg(if is_sel { MUTED } else { DIM }),
+                ),
+            ]),
             Rect::new(x, y + cover_h + 1, cw, 1),
         );
         app.hits.push((card, Hit::Row(idx)));
@@ -1139,13 +1359,14 @@ fn help(f: &mut Frame, area: Rect) {
         ("h  ←  ⌫", "back", "]  [", "seek ±10s"),
         ("o", "open playing album", "a", "add to queue"),
         ("H   Tab", "playlists   queue", "P", "play this album / list"),
-        ("K   J", "move queued song up/down", "", ""),
+        ("K   J", "move queued song up/down", "L", "show / hide lyrics"),
         ("", "", "", ""),
         ("SEARCH", "", "COMMANDS", ""),
         ("/  i", "search", ":vol 50", ":seek 1:23  :seek +30"),
         ("!s !a", "songs  albums", ":shuffle on", ":repeat track"),
         ("!p !r", "playlists  artists", ":play <uri>", ":queue  :home"),
         ("Tab", "cycle filter", ":stop", "stop soloist"),
+        ("", "", ":pin", "pin / unpin playlist"),
         ("esc  ⏎", "leave search", ":q", "quit"),
         ("S", "setup / credentials", ":login", "reconnect Spotify"),
         ("A", "art: pixel → dots → image", ":bg", "background: spin/still/off"),

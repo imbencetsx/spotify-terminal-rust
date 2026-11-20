@@ -1,6 +1,8 @@
 //! Shared data types: things you can see in a list, and where lists come from.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Kind {
     Track,
     Episode,
@@ -56,7 +58,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Item {
     pub kind: Kind,
     pub uri: String,

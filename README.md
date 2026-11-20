@@ -69,10 +69,13 @@ Press `/` and type. Results update live. Start the query with a prefix to filter
 | `Tab` | queue | `H` | library |
 | `K` `J` | move the selected queued song up or down | `Ctrl+C` | quit and stop playback |
 | `P` | play the open album or playlist | `?` | help |
+| `L` | show or hide lyrics | `⏎` on a synced lyric | seek to that line |
 
 Commands work like vim: `:vol 50`, `:seek 1:23`, `:shuffle on`, `:repeat track`, `:play spotify:album:…`, `:q`.
 
 Click a cover tile to open it or a song to play it. In the queue, click to select and double-click to play. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
+
+Select a playlist or open it and type `:pin` to pin it to the top of the home grid. Pinned playlists show a star and are saved locally. Use `:pin` again or `:unpin` to remove a pin.
 
 ### Queue
 
@@ -80,14 +83,22 @@ Press `a` to add a song to the current `str` session. Open the queue with `Tab` 
 
 Quitting the player stops a Soloist process it started. If you started Soloist separately, quitting pauses playback on that device and leaves the daemon running.
 
+### Lyrics
+
+Press `L` or click **Lyrics** in the player. Synced lyrics highlight the current line and follow playback. Scroll or use `j` / `k` to read ahead. Click a timed line or press Enter to seek to it. Plain lyrics can be scrolled when synced lyrics are unavailable.
+
+The player loads lyrics automatically and previews the previous line, the current line, and the next two lines when synced lyrics are available. Lookups send the song’s title, artist, album, and duration to [LRCLIB](https://lrclib.net/docs). Set `lyrics = false` at the top level of your config to disable lookups.
+
 ### macOS Now Playing
 
 The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
 Album art is drawn as text so it fits the terminal. `A` cycles the style, and `art = "…"` in the config sets the default:
-- `pixel` (default): chunky square pixels with a reduced palette.
+- `pixel` (default): full-color half blocks with smooth resampling.
 - `dots`: a dot matrix, where dot size follows brightness.
 - `image`: the real picture, using kitty graphics in kitty and Ghostty or iTerm2 graphics in iTerm2 and WezTerm (`images = "…"` overrides this).
+
+List thumbnails use terminal graphics when available. Other terminals use a denser text rendering in the same four columns by two rows.
 
 ### Spotify API limits (Feb 2026 dev-mode rules)
 
@@ -100,6 +111,6 @@ Album art is drawn as text so it fits the terminal. `A` cycles the style, and `a
 ```sh
 cargo run --example mock_soloist -- /tmp/fake-soloist   # fake Soloist + fake Web API
 # then, using the printed STR_API_BASE, with [soloist] data_dir = "/tmp/fake-soloist":
-STR_API_BASE=http://127.0.0.1:PORT/v1 cargo run
+STR_API_BASE=http://127.0.0.1:PORT/v1 STR_LYRICS_BASE=http://127.0.0.1:PORT/lyrics cargo run
 cargo test
 ```

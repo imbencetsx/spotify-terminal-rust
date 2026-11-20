@@ -27,7 +27,7 @@ impl Lyrics {
             return None;
         }
         // small lead so the highlight lands with the voice, not after it
-        let p = pos_ms + 150;
+        let p = pos_ms.saturating_add(150);
         self.lines.partition_point(|l| l.at_ms <= p).checked_sub(1)
     }
 }
@@ -86,10 +86,13 @@ pub async fn fetch(http: &reqwest::Client, track: &str, artist: &str, album: &st
         .timeout(Duration::from_secs(15))
         .send()
         .await?;
-    if !resp.status().is_success() {
-        return Ok(State::Missing);
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Ok(State::Missing),
+        429 => bail!("lyrics: too many requests, try again in a bit"),
+        s => bail!("lyrics: HTTP {s}"),
     }
-    let mut found: Vec<Record> = resp.json().await.unwrap_or_default();
+    let mut found: Vec<Record> = resp.json().await?;
     found.retain(|r| secs == 0 || r.duration.is_some_and(|d| (d - secs as f64).abs() <= 3.0));
     found.sort_by_key(|r| (r.synced_lyrics.is_none(), r.duration.map(|d| ((d - secs as f64).abs() * 10.0) as u64)));
     Ok(found.iter().find_map(to_state).unwrap_or(State::Missing))
@@ -137,7 +140,10 @@ fn stamp(tag: &str) -> Option<u64> {
     let (m, s) = tag.split_once(':')?;
     let m: u64 = m.trim().parse().ok()?;
     let s: f64 = s.trim().parse().ok()?;
-    Some(m * 60_000 + (s * 1000.0).round() as u64)
+    if !s.is_finite() || !(0.0..60.0).contains(&s) {
+        return None;
+    }
+    m.checked_mul(60_000)?.checked_add((s * 1000.0).round() as u64)
 }
 
 #[cfg(test)]
