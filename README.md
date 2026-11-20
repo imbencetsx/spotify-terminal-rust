@@ -83,6 +83,8 @@ Click **Sort** on Home or type `:sort` to cycle through Spotify order, A–Z, an
 
 Press `a` to add a song to the queue and `Tab` to see what’s next. **Next in queue** lists songs you added. Move them with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. They play before the tracks listed under **Next from**.
 
+Click **Clear queue** or type `:clearqueue` to remove songs added in `str`. The active collection and songs queued in Spotify stay in place.
+
 Click a track in an album, playlist, or Liked Songs to start there. The collection continues in order or shuffled, according to the shuffle toggle. Clicking a search result plays that track on its own and Soloist handles subsequent autoplay if available.
 
 Quitting the player stops a Soloist process it started. If you started Soloist separately, quitting pauses playback on that device and leaves the daemon running.

@@ -81,6 +81,32 @@ fn rgb(p: &image::Rgb<u8>) -> Color {
     Color::Rgb(p[0], p[1], p[2])
 }
 
+/// Draw a digit halfway between the baselines of a two-row song card.
+pub fn track_digit(digit: usize, width: u32, height: u32, color: [u8; 3]) -> DynamicImage {
+    const GLYPHS: [u16; 10] = [
+        0b111_101_101_101_111, 0b010_110_010_010_111,
+        0b111_001_111_100_111, 0b111_001_111_001_111,
+        0b101_101_111_001_001, 0b111_100_111_001_111,
+        0b111_100_111_101_111, 0b111_001_010_010_010,
+        0b111_101_111_101_111, 0b111_101_111_001_111,
+    ];
+    let mut pixels = image::RgbaImage::new(width, height * 2);
+    let glyph_h = (height * 2 / 3).max(1);
+    let glyph_w = (glyph_h * 3 / 5).clamp(1, width);
+    let pixel = image::Rgba([color[0], color[1], color[2], 255]);
+    let x0 = (width - glyph_w) / 2;
+    let y0 = (height * 2 - glyph_h) / 2;
+    for y in 0..glyph_h {
+        for x in 0..glyph_w {
+            let bit = 14 - (y * 5 / glyph_h) * 3 - x * 3 / glyph_w;
+            if GLYPHS[digit] & (1 << bit) != 0 {
+                pixels.put_pixel(x0 + x, y0 + y, pixel);
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(pixels)
+}
+
 /// Crop evenly from the sides or ends to match the display aspect ratio.
 fn center_crop(img: &DynamicImage, width: u32, height: u32) -> Cow<'_, DynamicImage> {
     let (source_w, source_h) = (img.width(), img.height());

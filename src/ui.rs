@@ -771,7 +771,16 @@ fn pane(f: &mut Frame, app: &mut App, area: Rect) {
             }
             x += sw(label) + 1;
         }
-        let r = Rect::new(x, y, area.right().saturating_sub(x), 1);
+        let clear = " Clear queue ";
+        let clear_width = sw(clear);
+        let mut end = area.right();
+        if end.saturating_sub(x) >= clear_width {
+            end -= clear_width;
+            let button = Rect::new(end, y, clear_width, 1);
+            f.render_widget(Line::styled(clear, Style::new().fg(MUTED).bg(CARD_BG)), button);
+            app.hits.push((button, Hit::QueueClear));
+        }
+        let r = Rect::new(x, y, end.saturating_sub(x), 1);
         f.render_widget(Line::styled("Move queued song", Style::new().fg(DIM)), r);
         y += 2;
     }
@@ -891,6 +900,27 @@ fn draw_cover_bitmap(f: &mut Frame, app: &mut App, area: Rect, url: &str) -> boo
     true
 }
 
+fn track_number(f: &mut Frame, app: &mut App, area: Rect, index: usize, playing: bool) {
+    let number = index.to_string();
+    if number.len() <= area.width as usize {
+        let x = area.right() - number.len() as u16;
+        let mut drawn = false;
+        for (i, digit) in number.bytes().enumerate() {
+            let Some(image) = app.track_digit(digit - b'0', playing) else { break };
+            f.render_widget(ratatui_image::Image::new(image), Rect::new(x + i as u16, area.y, 1, 2));
+            drawn = true;
+        }
+        if drawn {
+            return;
+        }
+    }
+    let style = Style::new().fg(if playing { accent() } else { DIM });
+    f.render_widget(
+        Line::styled(number, style).alignment(Alignment::Right),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+}
+
 /// Two-line rows: thumbnail, title over artists (or kind · artists), extras.
 fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
     const RH: u16 = 2; // text rows per item
@@ -939,10 +969,8 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
             f.render_widget(Line::styled("▎", Style::new().fg(accent())), Rect::new(body.x, y + 1, 1, 1));
         }
         if numbered {
-            f.render_widget(
-                Line::styled(format!("{:>3}", idx + 1), Style::new().fg(if playing { accent() } else { DIM })),
-                Rect::new(body.x + 1, y, 3, 1),
-            );
+            let width = if idx >= 999 { 5 } else { 3 };
+            track_number(f, app, Rect::new(body.x + 1, y, width, RH), idx + 1, playing);
         }
         thumb(f, app, Rect::new(x_thumb, y, TW, RH), it);
 
@@ -1398,6 +1426,7 @@ fn help(f: &mut Frame, area: Rect) {
         ("/  i", "search", ":vol 50", ":seek 1:23  :seek +30"),
         ("!s !a", "songs  albums", ":shuffle on", ":repeat track"),
         ("!p !r", "playlists  artists", ":play <uri>", ":queue  :home"),
+        ("", "", ":clearqueue", "clear songs added to queue"),
         ("Tab", "cycle filter", ":stop", "stop soloist"),
         (":pin", "pin / unpin playlist", ":sort", "cycle playlist order"),
         ("esc  ⏎", "leave search", ":q", "quit"),

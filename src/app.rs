@@ -33,6 +33,7 @@ pub enum Msg {
     Queued {
         items: Vec<Item>,
         name: String,
+        revision: u64,
     },
     ContextPage {
         context: u64,
@@ -218,6 +219,7 @@ pub enum Hit {
     /// A line on the lyrics page: seeks there.
     LyricLine(usize),
     QueueMove(isize),
+    QueueClear,
 }
 
 struct PlaybackContext {
@@ -247,7 +249,7 @@ impl PlaybackContext {
 
 #[derive(Clone, Copy)]
 enum TrackOrigin {
-    Queue(usize),
+    Queue { index: usize, revision: u64 },
     Context(usize),
 }
 
@@ -266,6 +268,11 @@ struct PlayedTrack {
     from_cursor: Option<usize>,
 }
 
+struct ManualAdvance {
+    since: Instant,
+    expected_uri: Option<String>,
+}
+
 pub enum Thumbnail {
     Bitmap(Protocol),
     Text(crate::art::Rendered),
@@ -282,11 +289,12 @@ pub struct App {
     /// A standalone track can reset Soloist's context options.
     shuffle_preference: Option<bool>,
     queued: Vec<Item>,
+    queue_revision: u64,
     context: Option<PlaybackContext>,
     queue_start: Option<TrackStart>,
     queue_history: Vec<PlayedTrack>,
     queue_retry_blocked: bool,
-    manual_advance: Option<Instant>,
+    manual_advance: Option<ManualAdvance>,
     pub soloist_child: Option<tokio::process::Child>,
     pub views: Vec<View>,
     home_items: Vec<Item>,
@@ -314,6 +322,7 @@ pub struct App {
     pub shown: [Option<String>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
     thumbnails: HashMap<(String, u16, u16, crate::art::Style), Thumbnail>,
+    track_digits: [Option<Protocol>; 20],
     pub hits: Vec<(Rect, Hit)>,
     pub pointer: Option<Position>,
     pub list_height: usize,
@@ -361,6 +370,7 @@ impl App {
             player: Player::default(),
             shuffle_preference: None,
             queued: Vec::new(),
+            queue_revision: 0,
             context: None,
             queue_start: None,
             queue_history: Vec::new(),
@@ -389,6 +399,7 @@ impl App {
             shown: [None, None],
             art_cache: HashMap::new(),
             thumbnails: HashMap::new(),
+            track_digits: std::array::from_fn(|_| None),
             hits: Vec::new(),
             pointer: None,
             list_height: 20,
@@ -653,6 +664,14 @@ impl App {
         self.queued.len()
     }
 
+    fn clear_queue(&mut self) {
+        self.queue_revision += 1;
+        self.queued.clear();
+        self.queue_retry_blocked = false;
+        self.refresh_queue_views();
+        self.info("Cleared songs queued in str");
+    }
+
     pub fn upcoming_label(&self) -> String {
         if let Some(context) = &self.context {
             format!("Next from {}", context.name)
@@ -679,7 +698,13 @@ impl App {
 
     fn start_queued(&mut self, index: usize) {
         if let Some(item) = self.queued.get(index).cloned()
-            && self.start_followup(item, TrackOrigin::Queue(index))
+            && self.start_followup(
+                item,
+                TrackOrigin::Queue {
+                    index,
+                    revision: self.queue_revision,
+                },
+            )
         {
             self.queued.remove(index);
             self.refresh_queue_views();
@@ -719,10 +744,14 @@ impl App {
 
     fn restore_queue_start(&mut self) {
         if let Some(start) = self.queue_start.take() {
-            if let TrackOrigin::Queue(index) = start.origin {
-                self.queued.insert(index.min(self.queued.len()), start.track);
-            }
-            self.queue_retry_blocked = true;
+            self.queue_retry_blocked = match start.origin {
+                TrackOrigin::Queue { index, revision } if revision == self.queue_revision => {
+                    self.queued.insert(index.min(self.queued.len()), start.track);
+                    true
+                }
+                TrackOrigin::Queue { .. } => false,
+                TrackOrigin::Context(_) => true,
+            };
             self.refresh_queue_views();
         }
     }
@@ -873,7 +902,8 @@ impl App {
     fn play_uri(&mut self, uri: &str) -> bool {
         self.ensure_active();
         let shuffle = self.shuffle_enabled();
-        let request = if uri.starts_with("spotify:album:") || uri.starts_with("spotify:playlist:") {
+        let collection = uri.starts_with("spotify:album:") || uri.starts_with("spotify:playlist:");
+        let request = if collection {
             soloist::Request::PlayCollection {
                 uri: uri.to_owned(),
                 shuffle,
@@ -890,7 +920,7 @@ impl App {
         self.context = None;
         self.refresh_queue_views();
         self.queue_retry_blocked = false;
-        self.manual_advance = Some(Instant::now());
+        self.mark_manual_advance((!collection).then(|| uri.to_owned()));
         true
     }
 
@@ -917,7 +947,7 @@ impl App {
         if self.queue_start.is_none() && !self.advance_followup() {
             self.context = None;
             self.refresh_queue_views();
-            self.manual_advance = Some(Instant::now());
+            self.mark_manual_advance(None);
             self.send("skip_next", Value::Null);
         }
     }
@@ -960,7 +990,7 @@ impl App {
         if self.queue_start.is_some() {
             return;
         }
-        self.manual_advance = Some(Instant::now());
+        self.mark_manual_advance(None);
         if let Some(current) = &self.player.item
             && self
                 .queue_history
@@ -975,7 +1005,10 @@ impl App {
                 return;
             };
             match entry.origin {
-                TrackOrigin::Queue(_) => self.queued.insert(0, current),
+                TrackOrigin::Queue { revision, .. } if revision == self.queue_revision => {
+                    self.queued.insert(0, current);
+                }
+                TrackOrigin::Queue { .. } => {}
                 TrackOrigin::Context(index) => {
                     let shuffle = self.shuffle_enabled();
                     if let (Some(context), Some(cursor)) =
@@ -994,12 +1027,20 @@ impl App {
                 }
             }
             self.refresh_queue_views();
+            self.mark_manual_advance(Some(entry.previous.uri.clone()));
             self.send("play", json!({ "uri": entry.previous.uri }));
         } else if self.player.connected {
             let _ = self.ws.send(soloist::Request::Previous);
         } else {
             self.error("soloist not connected");
         }
+    }
+
+    fn mark_manual_advance(&mut self, expected_uri: Option<String>) {
+        self.manual_advance = Some(ManualAdvance {
+            since: Instant::now(),
+            expected_uri,
+        });
     }
 
     pub fn shuffle_enabled(&self) -> bool {
@@ -1202,6 +1243,7 @@ impl App {
                     _ => Source::Liked,
                 };
                 let (tx, name) = (self.tx.clone(), it.name.clone());
+                let revision = self.queue_revision;
                 self.info(format!("queueing {name}…"));
                 tokio::spawn(async move {
                     let items = api.fetch(&src, 0).await.map_or_else(
@@ -1213,7 +1255,7 @@ impl App {
                                 .collect()
                         },
                     );
-                    let _ = tx.send(Msg::Queued { items, name });
+                    let _ = tx.send(Msg::Queued { items, name, revision });
                 });
             }
             _ => self.error("can't queue that"),
@@ -1591,7 +1633,10 @@ impl App {
             Msg::Lyrics { uri, state } => {
                 self.lyrics.insert(uri, state);
             }
-            Msg::Queued { items, name } => {
+            Msg::Queued { items, name, revision } => {
+                if revision != self.queue_revision {
+                    return;
+                }
                 if items.is_empty() {
                     self.error(format!("couldn't queue {name}"));
                 } else {
@@ -1658,15 +1703,17 @@ impl App {
     fn on_player_event(&mut self, event: Value) {
         let kind = event["type"].as_str().unwrap_or_default();
         let track_update = matches!(kind, "track_changed" | "playback_state");
-        let track_changed = track_update
-            && event["item"]["uri"].as_str() != self.player.item.as_ref().map(|i| i.uri.as_str());
+        let next_uri = track_update
+            .then(|| event["item"]["uri"].as_str())
+            .flatten()
+            .filter(|uri| !uri.is_empty());
+        let track_changed =
+            next_uri.is_some() && next_uri != self.player.item.as_ref().map(|i| i.uri.as_str());
         let duration = self.player.duration();
         let finishing = self.player.playing()
             && duration > 0
             && self.player.position().saturating_add(350) >= duration;
-        let finishing_track = (finishing && track_changed)
-            .then(|| self.player.item.clone())
-            .flatten();
+        let finishing_track = finishing.then(|| self.player.item.clone()).flatten();
         let was_starting = self.queue_start.is_some();
         match self.player.apply(&event) {
             Change::LoggedIn => {
@@ -1709,9 +1756,20 @@ impl App {
         }
         let manually_changed = self
             .manual_advance
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-        if track_changed {
+            .as_ref()
+            .is_some_and(|advance| advance.since.elapsed() < Duration::from_secs(3));
+        if let Some(uri) = next_uri
+            && self
+                .manual_advance
+                .as_ref()
+                .is_some_and(|advance| match &advance.expected_uri {
+                    Some(expected) => expected == uri,
+                    None => track_changed,
+                })
+        {
             self.manual_advance = None;
+        }
+        if track_changed {
             self.lyrics_manual = None;
             for view in self.views.iter_mut().filter(|v| v.source == Source::Lyrics) {
                 view.sel = 0;
@@ -1758,13 +1816,16 @@ impl App {
             .is_some_and(|s| s.since.elapsed() >= Duration::from_secs(5))
         {
             self.restore_queue_start();
-            self.error("Soloist didn’t start the queued song. Press n to retry.");
+            if self.queue_retry_blocked {
+                self.error("Soloist didn’t start the next song. Press n to retry.");
+            }
         }
         let duration = self.player.duration();
         if self.can_auto_advance()
             && self
                 .manual_advance
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+                .as_ref()
+                .is_none_or(|advance| advance.since.elapsed() >= Duration::from_secs(3))
             && self.player.playing()
             && duration > 0
             && self.player.position() >= duration
@@ -1971,6 +2032,25 @@ impl App {
     pub fn uses_cover_bitmaps(&self) -> bool {
         self.art != crate::art::Style::Dots
             && self.picker.protocol_type() != ProtocolType::Halfblocks
+    }
+
+    pub fn track_digit(&mut self, digit: u8, playing: bool) -> Option<&Protocol> {
+        if self.picker.protocol_type() != ProtocolType::Kitty {
+            return None;
+        }
+        let digit = usize::from(digit);
+        let index = digit + if playing { 10 } else { 0 };
+        let slot = &mut self.track_digits[index];
+        if slot.is_none() {
+            let font = self.picker.font_size();
+            if font.width == 0 || font.height == 0 {
+                return None;
+            }
+            let color = if playing { [232; 3] } else { [105; 3] };
+            let bitmap = crate::art::track_digit(digit, font.width.into(), font.height.into(), color);
+            *slot = self.picker.new_protocol(bitmap, (1, 2).into(), Resize::default()).ok();
+        }
+        slot.as_ref()
     }
 
     pub fn cycle_art(&mut self) {
@@ -2237,6 +2317,8 @@ impl App {
                     None => self.error("usage: :seek 1:23 | +10 | -10"),
                 }
             }
+            "queue" | "qu" if arg == "clear" => self.clear_queue(),
+            "clearqueue" => self.clear_queue(),
             "queue" | "qu" => self.open_queue(),
             "lyrics" | "ly" | "lyr" => self.toggle_lyrics(),
             "pin" => self.pin_playlist(None),
@@ -2339,6 +2421,7 @@ impl App {
                     Hit::Toggle => self.toggle(),
                     Hit::Next => self.next(),
                     Hit::QueueMove(delta) => self.move_queue_item(delta),
+                    Hit::QueueClear => self.clear_queue(),
                     Hit::Repeat => self.repeat(None),
                     Hit::Progress => {
                         let f = (x.saturating_sub(r.x)) as f64 / r.width.max(1) as f64;
@@ -2412,6 +2495,7 @@ mod tests {
             panic!("expected terminal graphics for the thumbnail");
         };
         assert_eq!(image.size(), (4, 2).into());
+        assert_eq!(app.track_digit(1, false).unwrap().size(), (1, 2).into());
     }
 
     #[test]
@@ -2638,6 +2722,70 @@ mod tests {
         assert!(matches!(
             commands.try_recv().unwrap(),
             soloist::Request::Send(skip) if skip == soloist::command("skip_next", Value::Null)
+        ));
+    }
+
+    #[test]
+    fn buffering_snapshot_does_not_drop_the_selected_playlist() {
+        let (mut app, mut commands) = connected_app();
+        let mut view = app.new_view("Playlist", Source::Playlist("test".into()));
+        view.items = (0..4)
+            .map(|i| {
+                Item::new(
+                    Kind::Track,
+                    format!("spotify:track:{i}"),
+                    format!("Song {i}"),
+                )
+            })
+            .collect();
+        app.player.item = view.items.first().cloned();
+        app.push(view);
+        app.select(1);
+        app.activate();
+        let _ = commands.try_recv().expect("play the selected song");
+
+        app.on_player_event(json!({"type": "playback_state", "status": "buffering", "item": null}));
+        app.on_player_event(json!({
+            "type": "track_changed",
+            "item": {"uri": "spotify:track:1", "entity_type": "track"}
+        }));
+        app.next();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            soloist::Request::Send(play) if play == soloist::command("play", json!({"uri": "spotify:track:2"}))
+        ));
+    }
+
+    #[test]
+    fn clearing_the_queue_keeps_context_and_ignores_old_queue_additions() {
+        let (mut app, mut commands) = connected_app();
+        let mut view = app.new_view("Album", Source::Album("test".into()));
+        view.items = vec![
+            Item::new(Kind::Track, "spotify:track:first", "First"),
+            Item::new(Kind::Track, "spotify:track:second", "Second"),
+        ];
+        app.push(view);
+        app.activate();
+        let _ = commands.try_recv().expect("play first track");
+        let queued = Item::new(Kind::Track, "spotify:track:queued", "Queued");
+        app.queued.extend([queued.clone(), queued.clone()]);
+        app.start_queued(0);
+        let _ = commands.try_recv().expect("start queued track");
+        let revision = app.queue_revision;
+        app.run_command("clearqueue");
+        app.restore_queue_start();
+        app.on_msg(Msg::Queued {
+            items: vec![queued],
+            name: "Old request".into(),
+            revision,
+        });
+        assert!(app.queued.is_empty());
+        assert!(!app.queue_retry_blocked);
+
+        app.next();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            soloist::Request::Send(play) if play == soloist::command("play", json!({"uri": "spotify:track:second"}))
         ));
     }
 }
