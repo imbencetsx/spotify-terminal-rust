@@ -753,11 +753,11 @@ fn pane(f: &mut Frame, app: &mut App, area: Rect) {
     let mut y = area.y;
     if app.view().source == Source::Queue && app.queued_len() > 0 && area.height >= 3 {
         let local = app.queued_len();
-        let sel = app.view().sel;
+        let sel = app.view().sel.checked_sub(app.history_next_len());
         let mut x = area.x;
         for (label, delta, enabled) in [
-            (" ↑ K ", -1, sel > 0 && sel < local),
-            (" ↓ J ", 1, sel + 1 < local),
+            (" ↑ K ", -1, sel.is_some_and(|i| i > 0 && i < local)),
+            (" ↓ J ", 1, sel.is_some_and(|i| i + 1 < local)),
         ] {
             let style = if enabled {
                 Style::new().fg(FG).bg(SEL_BG)
@@ -1028,11 +1028,15 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
 /// One-line rows (album pages, narrow panes).
 fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
+    let forward = app.history_next_len();
     let local = app.queued_len();
+    let queue_end = forward + local;
     let queue = app.view().source == Source::Queue;
     let upcoming = queue.then(|| app.upcoming_label());
     let sections = usize::from(queue && body.height >= 5)
-        * (usize::from(local > 0) + usize::from(app.view().items.len() > local));
+        * (usize::from(forward > 0)
+            + usize::from(local > 0)
+            + usize::from(app.view().items.len() > queue_end));
     let h = body.height as usize - sections;
     app.list_height = h;
     let with_scrolloff = app.pointer.is_none();
@@ -1060,8 +1064,14 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let mut y = body.y;
     for (row, it) in items.iter().enumerate() {
         let idx = scroll + row;
-        if sections > 0 && (row == 0 || idx == local) {
-            let label = if idx < local { "Next in queue" } else { upcoming.as_deref().unwrap_or("") };
+        if sections > 0 && (row == 0 || idx == forward || idx == queue_end) {
+            let label = if idx < forward {
+                "Resume playback"
+            } else if idx < queue_end {
+                "Next in queue"
+            } else {
+                upcoming.as_deref().unwrap_or("")
+            };
             f.render_widget(
                 Line::styled(label, Style::new().fg(MUTED).bold()),
                 Rect::new(body.x, y, body.width, 1),
@@ -1073,7 +1083,7 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
         let is_sel = idx == sel;
         let playing = playing_uri.as_deref() == Some(it.uri.as_str()) && !it.uri.is_empty();
         let bg = if is_sel { SEL_BG } else { BG };
-        let marker = if queue && idx < local {
+        let marker = if queue && (forward..queue_end).contains(&idx) {
             Span::styled("↕ ", Style::new().fg(if is_sel { accent() } else { MUTED }))
         } else if playing {
             Span::styled("▶ ", Style::new().fg(accent()))

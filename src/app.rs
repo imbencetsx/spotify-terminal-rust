@@ -251,23 +251,40 @@ impl PlaybackContext {
 enum TrackOrigin {
     Queue { index: usize, revision: u64 },
     Context(usize),
+    HistoryBack,
+    HistoryForward(usize),
 }
 
 struct TrackStart {
     track: Item,
     origin: TrackOrigin,
-    from: Option<Item>,
-    from_cursor: Option<usize>,
+    same_track: bool,
     since: Instant,
     refresh_requested: bool,
 }
 
-struct PlayedTrack {
-    uri: String,
-    previous: Item,
-    origin: TrackOrigin,
-    from_cursor: Option<usize>,
-    skipped: bool,
+#[derive(Default)]
+struct PlaybackHistory {
+    current: Option<Item>,
+    previous: Vec<Item>,
+    forward: Vec<Item>,
+    skipped_current: bool,
+}
+
+impl PlaybackHistory {
+    fn record(&mut self, track: Item) {
+        if let Some(previous) = self.current.replace(track)
+            && !std::mem::take(&mut self.skipped_current)
+        {
+            self.previous.push(previous);
+        }
+    }
+
+    fn go_back(&mut self, track: Item) {
+        self.previous.pop();
+        self.forward.extend(self.current.replace(track));
+        self.skipped_current = false;
+    }
 }
 
 struct ManualAdvance {
@@ -296,7 +313,7 @@ pub struct App {
     context: Option<PlaybackContext>,
     queue_start: Option<TrackStart>,
     deferred_skip: i8,
-    queue_history: Vec<PlayedTrack>,
+    history: PlaybackHistory,
     queue_retry_blocked: bool,
     manual_advance: Option<ManualAdvance>,
     pub soloist_child: Option<tokio::process::Child>,
@@ -378,7 +395,7 @@ impl App {
             context: None,
             queue_start: None,
             deferred_skip: 0,
-            queue_history: Vec::new(),
+            history: PlaybackHistory::default(),
             queue_retry_blocked: false,
             manual_advance: None,
             soloist_child: None,
@@ -656,7 +673,15 @@ impl App {
         );
         for v in self.views.iter_mut().filter(|v| v.source == Source::Queue) {
             v.items.clear();
-            v.items.extend(self.queued.iter().chain(&upcoming).cloned());
+            v.items.extend(
+                self.history
+                    .forward
+                    .iter()
+                    .rev()
+                    .chain(&self.queued)
+                    .chain(&upcoming)
+                    .cloned(),
+            );
             v.loading = self
                 .context
                 .as_ref()
@@ -667,6 +692,10 @@ impl App {
 
     pub fn queued_len(&self) -> usize {
         self.queued.len()
+    }
+
+    pub fn history_next_len(&self) -> usize {
+        self.history.forward.len()
     }
 
     fn clear_queue(&mut self) {
@@ -690,15 +719,20 @@ impl App {
     }
 
     fn move_queue_item(&mut self, delta: isize) {
-        let from = self.view().sel;
-        if from >= self.queued.len() {
+        let offset = self.history_next_len();
+        let Some(from) = self
+            .view()
+            .sel
+            .checked_sub(offset)
+            .filter(|&i| i < self.queued.len())
+        else {
             self.info("Only songs added to the queue can be moved");
             return;
-        }
+        };
         let to = from.saturating_add_signed(delta).min(self.queued.len() - 1);
         self.queued.swap(from, to);
         self.refresh_queue_views();
-        self.select(to);
+        self.select(offset + to);
     }
 
     fn start_queued(&mut self, index: usize) {
@@ -736,13 +770,17 @@ impl App {
         if !self.send("play", json!({ "uri": track.uri })) {
             return false;
         }
+        self.seed_playback_history();
         self.manual_advance = None;
         self.queue_retry_blocked = false;
         self.queue_start = Some(TrackStart {
+            same_track: self
+                .player
+                .item
+                .as_ref()
+                .is_some_and(|item| item.uri == track.uri),
             track,
             origin,
-            from: self.player.item.clone(),
-            from_cursor: self.context.as_ref().map(|context| context.cursor),
             since: Instant::now(),
             refresh_requested: false,
         });
@@ -751,13 +789,16 @@ impl App {
 
     fn restore_queue_start(&mut self) {
         if let Some(start) = self.queue_start.take() {
+            self.history.skipped_current = false;
             self.queue_retry_blocked = match start.origin {
                 TrackOrigin::Queue { index, revision } if revision == self.queue_revision => {
                     self.queued.insert(index.min(self.queued.len()), start.track);
                     true
                 }
                 TrackOrigin::Queue { .. } => false,
-                TrackOrigin::Context(_) => true,
+                TrackOrigin::Context(_)
+                | TrackOrigin::HistoryBack
+                | TrackOrigin::HistoryForward(_) => true,
             };
             self.refresh_queue_views();
         }
@@ -922,7 +963,8 @@ impl App {
             return false;
         }
         self.shuffle_preference = Some(shuffle);
-        self.queue_history.clear();
+        self.seed_playback_history();
+        self.history.forward.clear();
         self.deferred_skip = 0;
         self.restore_queue_start();
         self.context = None;
@@ -941,10 +983,10 @@ impl App {
             context.advance_on_load = false;
         }
         if playing
-            && !self.queued.is_empty()
             && (self.player.item.is_none() || self.player.status == "idle")
+            && (!self.history.forward.is_empty() || !self.queued.is_empty())
         {
-            self.start_queued(0);
+            self.advance_followup();
             return;
         }
         self.ensure_active();
@@ -966,6 +1008,13 @@ impl App {
 
     fn advance_followup(&mut self) -> bool {
         if self.queue_start.is_some() {
+            return true;
+        }
+        if let Some(index) = self.history.forward.len().checked_sub(1) {
+            self.start_followup(
+                self.history.forward[index].clone(),
+                TrackOrigin::HistoryForward(index),
+            );
             return true;
         }
         if !self.queued.is_empty() {
@@ -999,90 +1048,25 @@ impl App {
     }
 
     fn prev(&mut self) {
+        if let Some(context) = &mut self.context {
+            context.advance_on_load = false;
+        }
         if self.skip_waiting() {
             self.deferred_skip = self.deferred_skip.saturating_sub(1);
             return;
         }
-        self.mark_manual_advance(None);
-        if let Some(current) = &self.player.item
-            && self
-                .queue_history
-                .last()
-                .is_some_and(|entry| entry.uri == current.uri)
-            && self.player.connected
-            && self.player.logged_in
-            && self.player.active
-        {
-            let current = current.clone();
-            let Some(mut entry) = self.queue_history.pop() else {
-                return;
-            };
-            while self
-                .queue_history
-                .last()
-                .is_some_and(|prior| prior.skipped && prior.uri == entry.previous.uri)
-                && let Some(prior) = self.queue_history.pop()
-            {
-                entry.previous = prior.previous;
-                entry.from_cursor = prior.from_cursor;
-            }
-            match entry.origin {
-                TrackOrigin::Queue { revision, .. } if revision == self.queue_revision => {
-                    self.queued.insert(0, current);
-                }
-                TrackOrigin::Queue { .. } => {}
-                TrackOrigin::Context(_) => {}
-            }
-            let replay = match entry.origin {
-                TrackOrigin::Context(index) => Some(index),
-                TrackOrigin::Queue { .. } => None,
-            };
-            if let Some(cursor) = entry.from_cursor {
-                self.rewind_context(cursor, replay);
-            }
-            self.refresh_queue_views();
-            self.mark_manual_advance(Some(entry.previous.uri.clone()));
-            self.send("play", json!({ "uri": entry.previous.uri }));
-        } else if let Some(context) = &self.context {
-            if self.shuffle_enabled() || context.cursor == 0 {
-                self.seek(0);
-                return;
-            }
-            let current = context.cursor;
-            let previous = current - 1;
-            let uri = context.tracks[previous].uri.clone();
-            if self.send("play", json!({ "uri": uri })) {
-                self.rewind_context(previous, Some(current));
-                self.refresh_queue_views();
-                self.mark_manual_advance(Some(uri));
-            }
-        } else if self.player.connected {
-            let _ = self.ws.send(soloist::Request::Previous);
-        } else {
+        if !self.player.connected {
             self.error("soloist not connected");
+        } else if let Some(previous) = self.history.previous.last().cloned() {
+            self.start_followup(previous, TrackOrigin::HistoryBack);
+        } else {
+            self.info("No earlier song in playback history");
         }
     }
 
-    fn rewind_context(&mut self, cursor: usize, replay: Option<usize>) {
-        let shuffle = self.shuffle_enabled();
-        let Some(context) = &mut self.context else {
-            return;
-        };
-        if context.cursor == cursor && replay.is_none() {
-            return;
-        }
-        context.cursor = cursor;
-        if let Some(index) = replay {
-            context.played.remove(&index);
-        }
-        context.played.insert(cursor);
-        context.reorder(shuffle);
-        if shuffle
-            && let Some(index) = replay
-            && let Some(pos) = context.upcoming.iter().position(|&i| i == index)
-        {
-            context.upcoming.remove(pos);
-            context.upcoming.insert(0, index);
+    fn seed_playback_history(&mut self) {
+        if self.history.current.is_none() {
+            self.history.current.clone_from(&self.player.item);
         }
     }
 
@@ -1103,10 +1087,7 @@ impl App {
             || self.manual_advance.as_ref().is_some_and(|advance| {
                 advance.since.elapsed() < Duration::from_secs(3)
                     && advance.expected_uri.as_deref().is_some_and(|expected| {
-                        self.player
-                            .item
-                            .as_ref()
-                            .is_none_or(|item| item.uri != expected)
+                        self.player.item.as_ref().is_none_or(|item| item.uri != expected)
                     })
             })
     }
@@ -1178,6 +1159,12 @@ impl App {
         };
         let sel = v.sel;
         if v.source == Source::Queue {
+            let forward = self.history_next_len();
+            let Some(sel) = sel.checked_sub(forward) else {
+                let index = forward - 1 - sel;
+                self.start_followup(it, TrackOrigin::HistoryForward(index));
+                return;
+            };
             if sel < self.queued.len() {
                 self.start_queued(sel);
                 return;
@@ -1583,7 +1570,7 @@ impl App {
                 self.player.connected = false;
                 self.player.logged_in = false;
                 self.player.queue.clear();
-                self.queue_history.clear();
+                self.manual_advance = None;
                 self.deferred_skip = 0;
                 self.player.down_reason = r;
                 self.restore_queue_start();
@@ -1774,6 +1761,7 @@ impl App {
     }
 
     fn on_player_event(&mut self, event: Value) {
+        self.seed_playback_history();
         let kind = event["type"].as_str().unwrap_or_default();
         let track_update = matches!(kind, "track_changed" | "playback_state");
         let next_uri = track_update
@@ -1787,15 +1775,15 @@ impl App {
                 .as_ref()
                 .is_some_and(|context| context.tracks[context.cursor].uri == uri)
                 || self
-                    .queue_history
-                    .last()
-                    .is_some_and(|entry| entry.uri == uri)
+                    .history
+                    .current
+                    .as_ref()
+                    .is_some_and(|item| item.uri == uri)
         });
         let duration = self.player.duration();
         let was_playing = self.player.playing();
         let finishing =
             was_playing && duration > 0 && self.player.position().saturating_add(350) >= duration;
-        let finishing_track = finishing.then(|| self.player.item.clone()).flatten();
         let was_starting = self.queue_start.is_some();
         match self.player.apply(&event) {
             Change::LoggedIn => {
@@ -1807,19 +1795,18 @@ impl App {
             Change::Other => {}
         }
         let start_confirmed = self.queue_start.as_ref().is_some_and(|start| {
-            let fresh_track = start
-                .from
-                .as_ref()
-                .is_none_or(|from| from.uri != start.track.uri);
             self.player
                 .item
                 .as_ref()
                 .is_some_and(|i| i.uri == start.track.uri)
                 && (kind == "track_changed"
-                    || (kind == "playback_state" && (fresh_track || self.player.pos_ms < 1_000))
+                    || (kind == "playback_state" && (!start.same_track || self.player.pos_ms < 1_000))
                     || (kind == "position_sync" && self.player.pos_ms < 1_000))
         });
-        if start_confirmed && let Some(start) = self.queue_start.take() {
+        if start_confirmed
+            && let Some(start) = self.queue_start.take()
+            && let Some(item) = self.player.item.clone()
+        {
             let shuffle = self.shuffle_enabled();
             if let TrackOrigin::Context(index) = start.origin
                 && let Some(context) = self.context.as_mut()
@@ -1830,14 +1817,16 @@ impl App {
                     .upcoming
                     .retain(|&i| i != index && (shuffle || i > index));
             }
-            if let Some(previous) = start.from {
-                self.queue_history.push(PlayedTrack {
-                    uri: start.track.uri,
-                    previous,
-                    origin: start.origin,
-                    from_cursor: start.from_cursor,
-                    skipped: false,
-                });
+            match start.origin {
+                TrackOrigin::HistoryBack => self.history.go_back(item),
+                TrackOrigin::HistoryForward(index) => {
+                    self.history.forward.truncate(index);
+                    self.history.record(item);
+                }
+                TrackOrigin::Queue { .. } | TrackOrigin::Context(_) => {
+                    self.history.forward.clear();
+                    self.history.record(item);
+                }
             }
             self.refresh_queue_views();
         }
@@ -1853,6 +1842,12 @@ impl App {
                     None => track_changed,
                 })
         });
+        let awaiting_selected_track = manually_changed
+            && !manual_confirmed
+            && self
+                .manual_advance
+                .as_ref()
+                .is_some_and(|advance| advance.expected_uri.is_some());
         if manual_confirmed {
             self.manual_advance = None;
         }
@@ -1875,32 +1870,38 @@ impl App {
             && self.can_auto_advance()
         {
             self.advance_followup();
-            if let (Some(start), Some(previous)) = (self.queue_start.as_mut(), finishing_track) {
-                start.from = Some(previous);
-            }
-        } else if kind == "track_changed"
-            && track_changed
+        } else if track_update
             && !was_starting
-            && !manually_changed
-            && !expected_context_track
-            && self.context.is_some()
+            && !awaiting_selected_track
+            && let Some(item) = self.player.item.clone()
         {
-            self.context = None;
-            self.refresh_queue_views();
+            let new_history_track = self
+                .history
+                .current
+                .as_ref()
+                .is_none_or(|current| current.uri != item.uri);
+            if new_history_track {
+                self.history.forward.clear();
+                self.history.record(item);
+                self.refresh_queue_views();
+            } else {
+                self.history.current = Some(item);
+            }
+            if kind == "track_changed"
+                && track_changed
+                && !manually_changed
+                && !expected_context_track
+                && self.context.is_some()
+            {
+                self.context = None;
+                self.refresh_queue_views();
+            }
         }
         if (start_confirmed || manual_confirmed) && !self.skip_waiting() {
             let skipping_ahead = start_confirmed && self.deferred_skip > 0;
             self.flush_deferred_skip();
-            if skipping_ahead
-                && self.queue_start.is_some()
-                && let Some(entry) = self.queue_history.last_mut()
-                && self
-                    .player
-                    .item
-                    .as_ref()
-                    .is_some_and(|item| item.uri == entry.uri)
-            {
-                entry.skipped = true;
+            if skipping_ahead && self.queue_start.is_some() {
+                self.history.skipped_current = true;
             }
         }
     }
@@ -1921,7 +1922,8 @@ impl App {
     }
 
     fn can_auto_advance(&self) -> bool {
-        (!self.queued.is_empty()
+        (!self.history.forward.is_empty()
+            || !self.queued.is_empty()
             || self.context.as_ref().is_some_and(|context| {
                 !context.upcoming.is_empty()
                     || context.next_page.is_some()
@@ -1959,7 +1961,7 @@ impl App {
             self.restore_queue_start();
             self.deferred_skip = 0;
             if self.queue_retry_blocked {
-                self.error("Soloist didn’t start the next song. Press n to retry.");
+                self.error("Soloist didn’t start the requested song.");
             }
         } else if let Some(start) = &mut self.queue_start
             && !start.refresh_requested
@@ -2797,7 +2799,20 @@ mod tests {
             panic!("expected playback of the previous song");
         };
         assert_eq!(play, soloist::command("play", json!({"uri": "spotify:track:current"})));
-        assert_eq!(app.queued[0].uri, "spotify:track:second");
+        app.on_player_event(json!({
+            "type": "track_changed",
+            "item": {"uri": "spotify:track:current", "entity_type": "track"}
+        }));
+        assert_eq!(app.queued[0].uri, "spotify:track:first");
+        assert_eq!(app.view().items[0].uri, "spotify:track:second");
+        assert_eq!(app.view().items[1].uri, "spotify:track:first");
+        app.clear_queue();
+        assert_eq!(app.view().items[0].uri, "spotify:track:second");
+        app.next();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            soloist::Request::Send(play) if play["uri"] == "spotify:track:second"
+        ));
     }
 
     #[test]
@@ -3018,22 +3033,95 @@ mod tests {
     }
 
     #[test]
-    fn previous_from_a_selected_album_track_stays_in_the_album() {
+    fn previous_from_an_album_returns_to_the_last_song_then_resumes_the_album() {
         let (mut app, mut commands) = connected_app();
         let mut view = app.new_view("Album", Source::Album("test".into()));
         view.items = vec![
             Item::new(Kind::Track, "spotify:track:first", "First"),
             Item::new(Kind::Track, "spotify:track:second", "Second"),
+            Item::new(Kind::Track, "spotify:track:third", "Third"),
         ];
-        app.player.item = view.items.last().cloned();
+        let report_track = |app: &mut App, uri: &str| {
+            app.on_player_event(json!({
+                "type": "track_changed",
+                "item": {"uri": uri, "entity_type": "track", "decorations": {
+                    "playback": {"duration_ms": 2_000}
+                }}
+            }));
+        };
+        let expect_play = |commands: &mut UnboundedReceiver<soloist::Request>, uri: &str| {
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                soloist::Request::Send(play) if play["uri"] == uri
+            ));
+        };
+        report_track(&mut app, "spotify:track:search");
         app.push(view);
         app.select(1);
         app.activate();
-        let _ = commands.try_recv().unwrap();
+        expect_play(&mut commands, "spotify:track:second");
+        app.prev(); // Previous also works while the selected track is still loading.
+        report_track(&mut app, "spotify:track:second");
+        expect_play(&mut commands, "spotify:track:search");
+        report_track(&mut app, "spotify:track:search");
+
+        app.player.status = "playing".into();
+        app.player.pos_ms = 2_000;
+        // A native autoplay event at the end can arrive before the next UI tick.
+        report_track(&mut app, "spotify:track:autoplay");
+        expect_play(&mut commands, "spotify:track:second");
+        report_track(&mut app, "spotify:track:second");
+
+        app.next();
+        expect_play(&mut commands, "spotify:track:third");
+        report_track(&mut app, "spotify:track:third");
         app.prev();
-        assert!(matches!(
-            commands.try_recv().unwrap(),
-            soloist::Request::Send(play) if play["uri"] == "spotify:track:first"
-        ));
+        expect_play(&mut commands, "spotify:track:second");
+        report_track(&mut app, "spotify:track:second");
+        app.prev();
+        expect_play(&mut commands, "spotify:track:search");
+    }
+
+    #[test]
+    fn previous_and_next_follow_history_across_sources() {
+        let (mut app, mut commands) = connected_app();
+        let report_track = |app: &mut App, uri: &str| {
+            app.on_player_event(json!({
+                "type": "track_changed",
+                "item": {"uri": uri, "entity_type": "track"}
+            }));
+        };
+        let expect_play = |commands: &mut UnboundedReceiver<soloist::Request>, uri: &str| {
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                soloist::Request::Send(play) if play["uri"] == uri
+            ));
+        };
+        report_track(&mut app, "spotify:track:search");
+        app.play_uri("spotify:track:album");
+        expect_play(&mut commands, "spotify:track:album");
+        report_track(&mut app, "spotify:track:album");
+        app.play_uri("spotify:track:playlist");
+        expect_play(&mut commands, "spotify:track:playlist");
+        report_track(&mut app, "spotify:track:playlist");
+
+        for _ in 0..500 {
+            app.prev();
+            app.prev();
+            expect_play(&mut commands, "spotify:track:album");
+            report_track(&mut app, "spotify:track:album");
+            expect_play(&mut commands, "spotify:track:search");
+            report_track(&mut app, "spotify:track:search");
+            app.prev();
+            assert!(commands.try_recv().is_err());
+            app.next();
+            expect_play(&mut commands, "spotify:track:album");
+            report_track(&mut app, "spotify:track:album");
+            app.next();
+            expect_play(&mut commands, "spotify:track:playlist");
+            report_track(&mut app, "spotify:track:playlist");
+            assert_eq!(app.history.previous.len(), 2);
+            assert!(app.history.forward.is_empty());
+        }
     }
 }

@@ -154,7 +154,6 @@ pub enum Event {
 
 pub enum Request {
     Send(Value),
-    Previous,
     PlayCollection { uri: String, shuffle: bool },
 }
 
@@ -193,14 +192,6 @@ pub async fn run(
                                 Some(Request::Send(v)) => if let Err(e) = ws.send(Message::text(v.to_string())).await {
                                     break format!("soloist connection lost: {e}");
                                 },
-                                Some(Request::Previous) => {
-                                    let result = previous_on(&mut ws, |v| {
-                                        let _ = tx.send(Event::Msg(v.clone()));
-                                    }).await;
-                                    if let Err(e) = result {
-                                        let _ = tx.send(Event::ControlError(format!("{e:#}")));
-                                    }
-                                }
                                 Some(Request::PlayCollection { uri, shuffle }) => {
                                     let result = play_collection(&mut ws, &uri, shuffle, |v| {
                                         let _ = tx.send(Event::Msg(v.clone()));
