@@ -14,6 +14,8 @@ pub enum Style {
     Dots,
     /// The real image via kitty / iTerm2 / sixel (falls back to half blocks).
     Image,
+    /// A bitmap with small, hard-edged pixels.
+    SoftPixel,
 }
 
 impl Style {
@@ -21,6 +23,7 @@ impl Style {
         match s {
             "dots" | "dot" | "matrix" => Style::Dots,
             "image" | "real" | "photo" => Style::Image,
+            "softpixel" => Style::SoftPixel,
             _ => Style::Pixel,
         }
     }
@@ -28,7 +31,8 @@ impl Style {
         match self {
             Style::Pixel => Style::Dots,
             Style::Dots => Style::Image,
-            Style::Image => Style::Pixel,
+            Style::Image => Style::SoftPixel,
+            Style::SoftPixel => Style::Pixel,
         }
     }
     pub fn name(self) -> &'static str {
@@ -36,6 +40,7 @@ impl Style {
             Style::Pixel => "pixel",
             Style::Dots => "dots",
             Style::Image => "image",
+            Style::SoftPixel => "softpixel",
         }
     }
 }
@@ -83,7 +88,7 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
         return Rendered { w, h, cells };
     }
     match style {
-        Style::Pixel | Style::Image => {
+        Style::Pixel | Style::Image | Style::SoftPixel => {
             let small = img.resize_exact(w32, h32 * 2, FilterType::Lanczos3).to_rgb8();
             for y in 0..h32 {
                 for x in 0..w32 {
@@ -120,6 +125,16 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
         }
     }
     Rendered { w, h, cells }
+}
+
+/// Downsample to a fine pixel grid and enlarge it without smoothing the edges.
+pub fn bitmap(img: &DynamicImage, width: u32, height: u32, softpixel: bool) -> DynamicImage {
+    if softpixel {
+        img.resize_exact(width.div_ceil(3), height.div_ceil(3), FilterType::Lanczos3)
+            .resize_exact(width, height, FilterType::Nearest)
+    } else {
+        img.resize_exact(width, height, FilterType::Lanczos3)
+    }
 }
 
 /// Use four color samples per cell when the terminal can't draw bitmap images.
@@ -359,6 +374,19 @@ mod tests {
     }
 
     #[test]
+    fn softpixel_bitmap_keeps_its_size_and_has_hard_pixel_edges() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(12, 6, |x, y| {
+            image::Rgb([(x * 20) as u8, (y * 40) as u8, 0])
+        }));
+        let smooth = bitmap(&image, 12, 6, false).to_rgb8();
+        let soft = bitmap(&image, 12, 6, true).to_rgb8();
+        assert_eq!(soft.dimensions(), smooth.dimensions());
+        assert_ne!(smooth.get_pixel(0, 0), smooth.get_pixel(1, 0));
+        assert_eq!(soft.get_pixel(0, 0), soft.get_pixel(2, 2));
+        assert_ne!(soft.get_pixel(2, 2), soft.get_pixel(3, 2));
+    }
+
+    #[test]
     fn dots_ramp() {
         let black = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
         assert!(render(&black, Style::Dots, 4, 2).cells.iter().all(|c| c.ch == '·'));
@@ -401,7 +429,7 @@ mod tests {
 
     #[test]
     fn styles_cycle() {
-        assert_eq!(Style::Pixel.next().next().next(), Style::Pixel);
+        assert_eq!(Style::Pixel.next().next().next().next(), Style::Pixel);
         assert_eq!(Style::parse("dots"), Style::Dots);
         assert_eq!(Style::parse("whatever"), Style::Pixel);
     }

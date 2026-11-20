@@ -77,6 +77,8 @@ Click a cover tile to open it or a song to play it. In the queue, click to selec
 
 Select a playlist or open it and type `:pin` to pin it to the top of the home grid. Pinned playlists show a star and are saved locally. Use `:pin` again or `:unpin` to remove a pin.
 
+Click **Sort** on Home or type `:sort` to cycle through Spotify order, A–Z, and most songs. Use `:sort spotify`, `:sort name`, or `:sort tracks` to choose directly. Pins stay at the top and the sort setting is saved.
+
 ### Queue
 
 Press `a` to add a song to the current `str` session. Open the queue with `Tab` and move a song with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. The `↕` marks editable rows. These songs play in order before Spotify’s upcoming tracks. Playing a queued song through Soloist can change the active album or playlist context. Spotify’s own upcoming rows are read-only.
@@ -93,10 +95,11 @@ The player loads lyrics automatically and previews the previous line, the curren
 
 The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
-Album art is drawn as text so it fits the terminal. `A` cycles the style, and `art = "…"` in the config sets the default:
+Use `:art image` for smooth artwork at the terminal’s pixel resolution. `A` cycles styles, and `art = "…"` in the config sets the default.
 - `pixel` (default): full-color half blocks with smooth resampling.
 - `dots`: a dot matrix, where dot size follows brightness.
 - `image`: the real picture, using kitty graphics in kitty and Ghostty or iTerm2 graphics in iTerm2 and WezTerm (`images = "…"` overrides this).
+- `softpixel`: bitmap covers with a fine pixel grid, drawn in the same space as `image`. Use `:art softpixel` to try it in the current session.
 
 List thumbnails use terminal graphics when available. Other terminals use a denser text rendering in the same four columns by two rows.
 

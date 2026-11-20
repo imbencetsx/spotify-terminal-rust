@@ -1,6 +1,6 @@
 //! App state + input handling.
 
-use crate::config::Config;
+use crate::config::{Config, PlaylistSort};
 use crate::model::{Item, Kind, Page, Source, parse_query};
 use crate::soloist::{self, Change, Player, Repeat};
 use crate::spotify::Api;
@@ -13,6 +13,7 @@ use ratatui_image::Resize;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::{Protocol, StatefulProtocol};
 use serde_json::{Value, json};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -191,6 +192,7 @@ impl Input {
 
 #[derive(Clone, Debug)]
 pub enum Hit {
+    PlaylistSort,
     SetupField(usize),
     SetupSave,
     SetupCancel,
@@ -288,7 +290,7 @@ pub struct App {
     /// Graphics-protocol state per slot (only in `art = image` mode).
     pub protos: [Option<Art>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
-    thumbnails: HashMap<(String, u16, u16), Thumbnail>,
+    thumbnails: HashMap<(String, u16, u16, bool), Thumbnail>,
     pub hits: Vec<(Rect, Hit)>,
     pub pointer: Option<Position>,
     pub list_height: usize,
@@ -469,7 +471,20 @@ impl App {
         self.playlist_pins.iter().any(|item| item.uri == uri)
     }
 
-    fn refresh_home_pins(&mut self) {
+    fn refresh_home_playlists(&mut self) {
+        let mut unpinned: Vec<_> = self.home_items.iter()
+            .filter(|item| !self.playlist_pinned(&item.uri))
+            .collect();
+        match self.cfg.playlist_sort {
+            PlaylistSort::Spotify => {}
+            PlaylistSort::Name => unpinned.sort_by_cached_key(|item| {
+                (item.kind != Kind::Liked, item.name.to_lowercase())
+            }),
+            PlaylistSort::Tracks => unpinned.sort_by_cached_key(|item| {
+                let count = item.extra.strip_suffix(" songs").and_then(|n| n.parse::<u64>().ok());
+                (item.kind != Kind::Liked, Reverse(count), item.name.to_lowercase())
+            }),
+        }
         let items = self
             .playlist_pins
             .iter()
@@ -479,11 +494,7 @@ impl App {
                     .find(|item| item.uri == pin.uri)
                     .unwrap_or(pin)
             })
-            .chain(
-                self.home_items
-                    .iter()
-                    .filter(|item| !self.playlist_pinned(&item.uri)),
-            )
+            .chain(unpinned)
             .cloned()
             .collect::<Vec<_>>();
         if let Some(view) = self
@@ -496,6 +507,40 @@ impl App {
                 .and_then(|item| items.iter().position(|i| i.uri == item.uri));
             view.items = items;
             view.sel = selected.unwrap_or(0);
+        }
+    }
+
+    fn sort_playlists(&mut self, arg: &str) {
+        let sort = match arg {
+            "" => self.cfg.playlist_sort.next(),
+            "spotify" => PlaylistSort::Spotify,
+            "name" => PlaylistSort::Name,
+            "tracks" => PlaylistSort::Tracks,
+            _ => {
+                self.error("Use :sort spotify, :sort name, or :sort tracks");
+                return;
+            }
+        };
+        match crate::config::save_values(&[(None, "playlist_sort", Some(sort.key()))]) {
+            Ok(()) => {
+                Arc::make_mut(&mut self.cfg).playlist_sort = sort;
+                self.refresh_home_playlists();
+                self.load_remaining_sorted_playlists();
+                self.info(format!("Playlists sorted by {}", sort.label()));
+            }
+            Err(e) => self.error(format!("Couldn’t save playlist sort: {e:#}")),
+        }
+    }
+
+    fn load_remaining_sorted_playlists(&mut self) {
+        if self.cfg.playlist_sort == PlaylistSort::Spotify {
+            return;
+        }
+        if let Some((index, view)) = self.views.iter().enumerate()
+            .find(|(_, view)| view.source == Source::Home && !view.loading)
+            && let Some(offset) = view.next
+        {
+            self.load(index, offset);
         }
     }
 
@@ -533,7 +578,7 @@ impl App {
         match result {
             Ok((pins, pinned, name)) => {
                 self.playlist_pins = pins;
-                self.refresh_home_pins();
+                self.refresh_home_playlists();
                 self.info(format!(
                     "{} {name}",
                     if pinned { "Pinned" } else { "Unpinned" }
@@ -1265,7 +1310,8 @@ impl App {
                             } else {
                                 self.home_items.extend(p.items);
                             }
-                            self.refresh_home_pins();
+                            self.refresh_home_playlists();
+                            self.load_remaining_sorted_playlists();
                             if is_top {
                                 self.maybe_load_more();
                             }
@@ -1655,16 +1701,18 @@ impl App {
     }
 
     pub fn thumbnail(&mut self, url: &str, w: u16, h: u16) -> Option<&Thumbnail> {
-        let key = (url.to_owned(), w, h);
+        let softpixel = self.art == crate::art::Style::SoftPixel;
+        let key = (url.to_owned(), w, h, softpixel);
         if !self.thumbnails.contains_key(&key) {
             let image = self.images.get(url)?;
             let bitmap = (self.picker.protocol_type() != ProtocolType::Halfblocks)
                 .then(|| {
                     let font = self.picker.font_size();
-                    let image = image.resize_exact(
+                    let image = crate::art::bitmap(
+                        image,
                         u32::from(w) * u32::from(font.width),
                         u32::from(h) * u32::from(font.height),
-                        image::imageops::FilterType::Lanczos3,
+                        softpixel,
                     );
                     self.picker.new_protocol(image, (w, h).into(), Resize::default()).ok()
                 })
@@ -1949,6 +1997,7 @@ impl App {
             "lyrics" | "ly" | "lyr" => self.toggle_lyrics(),
             "pin" => self.pin_playlist(None),
             "unpin" => self.pin_playlist(Some(false)),
+            "sort" => self.sort_playlists(arg),
             "add" => self.enqueue_selected(),
             "home" | "lib" | "library" | "playlists" | "lists" => self.go_home_clear(),
             "open" => self.open_now_playing(),
@@ -2062,6 +2111,7 @@ impl App {
                     Hit::Crumb(i) => self.views.truncate(i + 1),
                     Hit::PlayHeader => self.play_header(),
                     Hit::Lyrics => self.toggle_lyrics(),
+                    Hit::PlaylistSort => self.sort_playlists(""),
                     Hit::LyricLine(i) => {
                         self.select(i);
                         self.seek_to_line(i);

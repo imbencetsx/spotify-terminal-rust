@@ -235,10 +235,13 @@ fn cover(f: &mut Frame, app: &mut App, r: Rect, slot: usize) {
         && let Some(a) = app.protos[slot].as_mut()
     {
         f.render_stateful_widget(
-            StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle))),
+            StatefulImage::default().resize(Resize::Scale(Some(FilterType::Lanczos3))),
             r,
             &mut a.proto,
         );
+        return;
+    }
+    if app.art == ArtStyle::SoftPixel && draw_cover_bitmap(f, app, r, &url) {
         return;
     }
     match app.rendered_art(&url, r.width, r.height) {
@@ -727,6 +730,16 @@ fn crumbs(f: &mut Frame, app: &mut App, area: Rect) -> u16 {
     } else {
         format!("{}{}", v.items.len(), if v.next.is_some() { "+" } else { "" })
     };
+    if v.source == Source::Home {
+        let label = format!(" Sort: {} ", app.cfg.playlist_sort.label());
+        let w = sw(&label);
+        let end = area.right().saturating_sub(if right.is_empty() { 0 } else { sw(&right) + 2 });
+        let start = end.saturating_sub(w);
+        if start > x {
+            span_at(f, start, y, Span::styled(label, Style::new().fg(MUTED).bg(CARD_BG)));
+            app.hits.push((Rect::new(start, y, w, 1), Hit::PlaylistSort));
+        }
+    }
     if !right.is_empty() && x + sw(&right) + 2 < area.right() {
         f.render_widget(
             Line::styled(right, Style::new().fg(DIM)).alignment(Alignment::Right),
@@ -869,14 +882,19 @@ fn thumb(f: &mut Frame, app: &mut App, r: Rect, it: &Item) {
         f.render_widget(Block::new().style(Style::new().bg(Color::Rgb(38, 38, 38))), r);
         return;
     };
-    match app.thumbnail(&url, r.width, r.height) {
-        Some(Thumbnail::Bitmap(image)) => f.render_widget(ratatui_image::Image::new(image), r),
-        Some(Thumbnail::Text(art)) => art.draw(r, f.buffer_mut()),
-        None => {
-            app.fetch_image(url);
-            f.render_widget(Block::new().style(Style::new().bg(Color::Rgb(38, 38, 38))), r);
-        }
+    if !draw_cover_bitmap(f, app, r, &url) {
+        app.fetch_image(url);
+        f.render_widget(Block::new().style(Style::new().bg(Color::Rgb(38, 38, 38))), r);
     }
+}
+
+fn draw_cover_bitmap(f: &mut Frame, app: &mut App, area: Rect, url: &str) -> bool {
+    match app.thumbnail(url, area.width, area.height) {
+        Some(Thumbnail::Bitmap(image)) => f.render_widget(ratatui_image::Image::new(image), area),
+        Some(Thumbnail::Text(art)) => art.draw(area, f.buffer_mut()),
+        None => return false,
+    }
+    true
 }
 
 /// Two-line rows: thumbnail, title over artists (or kind · artists), extras.
@@ -1117,6 +1135,12 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
         let cover_r = Rect::new(x, y, cw, cover_h);
         match (&it.image, it.kind) {
             (_, Kind::Liked) => liked_cover(f, cover_r),
+            (Some(url), _) if matches!(app.art, ArtStyle::Image | ArtStyle::SoftPixel) => {
+                if !draw_cover_bitmap(f, app, cover_r, url) {
+                    app.fetch_image(url.clone());
+                    cover_placeholder(f, cover_r);
+                }
+            }
             (Some(url), _) => match app.rendered_art(url, cw, cover_h) {
                 Some(art) => art.draw(cover_r, f.buffer_mut()),
                 None => {
@@ -1366,10 +1390,11 @@ fn help(f: &mut Frame, area: Rect) {
         ("!s !a", "songs  albums", ":shuffle on", ":repeat track"),
         ("!p !r", "playlists  artists", ":play <uri>", ":queue  :home"),
         ("Tab", "cycle filter", ":stop", "stop soloist"),
-        ("", "", ":pin", "pin / unpin playlist"),
+        (":pin", "pin / unpin playlist", ":sort", "cycle playlist order"),
         ("esc  ⏎", "leave search", ":q", "quit"),
         ("S", "setup / credentials", ":login", "reconnect Spotify"),
-        ("A", "art: pixel → dots → image", ":bg", "background: spin/still/off"),
+        ("A", "cycle cover style", ":art", "pixel / dots / image / softpixel"),
+        ("", "", ":bg", "background: spin/still/off"),
     ];
     let w = 76.min(area.width.saturating_sub(4));
     let h = (rows.len() as u16 + 8).min(area.height.saturating_sub(2));
