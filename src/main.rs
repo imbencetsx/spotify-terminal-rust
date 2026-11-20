@@ -239,7 +239,7 @@ async fn tui(cfg: Arc<Config>, http: reqwest::Client, force_setup: bool) -> Resu
     let art = cfg.art.as_deref().map(art::Style::parse).unwrap_or(art::Style::Pixel);
     #[cfg(target_os = "macos")]
     let media = if cfg.now_playing.unwrap_or(true) {
-        now_playing::Bridge::start(tx.clone()).map(Some)
+        now_playing::Bridge::start(tx.clone()).await.map(Some)
     } else {
         Ok(None)
     };

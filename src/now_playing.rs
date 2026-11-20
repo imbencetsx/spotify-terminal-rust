@@ -9,7 +9,8 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, process::Stdio, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -50,13 +51,8 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn start(tx: UnboundedSender<Msg>) -> Result<Self> {
-        let contents = config::cache_dir().join("str Now Playing.app/Contents");
-        let bin = contents.join("MacOS/str-now-playing");
-        std::fs::create_dir_all(contents.join("MacOS"))?;
-        write_if_new(&contents.join("Info.plist"), PLIST, 0o644)?;
-        write_if_new(&bin, HELPER, 0o755)?;
-
+    pub async fn start(tx: UnboundedSender<Msg>) -> Result<Self> {
+        let bin = media_bundle().await?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -159,6 +155,53 @@ impl Bridge {
         }
         let _ = reader.await;
     }
+}
+
+async fn media_bundle() -> Result<PathBuf> {
+    let cache = config::cache_dir();
+    let probe = cache.join("str-now-playing");
+    std::fs::create_dir_all(&cache)?;
+    write_if_new(&probe, HELPER, 0o755)?;
+    let mut command = Command::new(probe);
+    command
+        .arg("--terminal-icon")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let icon = match tokio::time::timeout(Duration::from_secs(2), command.output()).await {
+        Ok(Ok(out)) if out.status.success() && out.stdout.starts_with(b"icns") => Some(out.stdout),
+        _ => None,
+    };
+    let (directory, plist) = if let Some(icon) = icon {
+        // Give each icon its own bundle identity so Launch Services can cache
+        // the badge without showing the previous terminal's icon.
+        let key = Sha256::digest(&icon)[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let directory = cache.join("now-playing").join(&key);
+        let resources = directory.join("str Now Playing.app/Contents/Resources");
+        std::fs::create_dir_all(&resources)?;
+        write_if_new(&resources.join("Terminal.icns"), &icon, 0o644)?;
+        let plist = String::from_utf8_lossy(PLIST)
+            .replace(
+                "io.str-player.now-playing",
+                &format!("io.str-player.now-playing.t{key}"),
+            )
+            .replace(
+                "</dict>",
+                "<key>CFBundleIconFile</key><string>Terminal.icns</string>\n</dict>",
+            )
+            .into_bytes();
+        (directory, plist)
+    } else {
+        (cache, PLIST.to_vec())
+    };
+    let contents = directory.join("str Now Playing.app/Contents");
+    let bin = contents.join("MacOS/str-now-playing");
+    std::fs::create_dir_all(contents.join("MacOS"))?;
+    write_if_new(&contents.join("Info.plist"), &plist, 0o644)?;
+    write_if_new(&bin, HELPER, 0o755)?;
+    Ok(bin)
 }
 
 fn write_if_new(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {

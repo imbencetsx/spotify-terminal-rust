@@ -81,7 +81,9 @@ Click **Sort** on Home or type `:sort` to cycle through Spotify order, A–Z, an
 
 ### Queue
 
-Press `a` to add a song to the current `str` session. Open the queue with `Tab` and move a song with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. The `↕` marks editable rows. These songs play in order before Spotify’s upcoming tracks. Playing a queued song through Soloist can change the active album or playlist context. Spotify’s own upcoming rows are read-only.
+Press `a` to add a song to the queue and `Tab` to see what’s next. **Next in queue** lists songs you added. Move them with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. They play before the tracks listed under **Next from**.
+
+Click a track in an album, playlist, or Liked Songs to start there. The collection continues in order or shuffled, according to the shuffle toggle. Clicking a search result plays that track on its own and Soloist handles subsequent autoplay if available.
 
 Quitting the player stops a Soloist process it started. If you started Soloist separately, quitting pauses playback on that device and leaves the daemon running.
 
@@ -93,7 +95,7 @@ The player loads lyrics automatically and previews the previous line, the curren
 
 ### macOS Now Playing
 
-The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
+The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. The small app badge uses the launching terminal’s icon when macOS can identify it. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
 Use `:art image` for smooth artwork at the terminal’s pixel resolution. `A` cycles styles, and `art = "…"` in the config sets the default.
 - `pixel` (default): pixel art scaled to the cover size. Tiny covers use a chunkier grid, and larger covers retain more detail. Terminals without image support use text blocks.
@@ -107,7 +109,6 @@ List thumbnails use terminal graphics when available. Other terminals use a dens
 
 - Search returns 10 results per page. `str` loads more pages as you scroll.
 - Spotify only lists the songs of playlists you own. Other playlists still play with `⏎`.
-- Clicking a song or pressing `⏎` on it plays that exact song, then queues the following loaded songs. Use the album or playlist’s Play button or `P` to start the full collection in order or shuffled, according to the shuffle toggle.
 
 ## Develop
 

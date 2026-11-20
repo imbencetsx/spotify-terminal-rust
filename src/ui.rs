@@ -751,7 +751,7 @@ fn crumbs(f: &mut Frame, app: &mut App, area: Rect) -> u16 {
 /// A view's header (cover + info) and its rows.
 fn pane(f: &mut Frame, app: &mut App, area: Rect) {
     let mut y = area.y;
-    if app.view().source == Source::Queue && !app.view().items.is_empty() && area.height >= 3 {
+    if app.view().source == Source::Queue && app.queued_len() > 0 && area.height >= 3 {
         let local = app.queued_len();
         let sel = app.view().sel;
         let mut x = area.x;
@@ -771,13 +771,8 @@ fn pane(f: &mut Frame, app: &mut App, area: Rect) {
             }
             x += sw(label) + 1;
         }
-        let label = if sel < local {
-            "Move queued song"
-        } else {
-            "Spotify upcoming • read-only"
-        };
         let r = Rect::new(x, y, area.right().saturating_sub(x), 1);
-        f.render_widget(Line::styled(label, Style::new().fg(DIM)), r);
+        f.render_widget(Line::styled("Move queued song", Style::new().fg(DIM)), r);
         y += 2;
     }
     if let Some(h) = app.view().header.clone()
@@ -1005,8 +1000,13 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
 /// One-line rows (album pages, narrow panes).
 fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
-    let h = body.height as usize;
     let local = app.queued_len();
+    let queue = app.view().source == Source::Queue;
+    let upcoming = queue.then(|| app.upcoming_label());
+    let sections = usize::from(queue && body.height >= 5)
+        * (usize::from(local > 0) + usize::from(app.view().items.len() > local));
+    let h = body.height as usize - sections;
+    app.list_height = h;
     let with_scrolloff = app.pointer.is_none();
     let v = top(app);
     if v.items.is_empty() {
@@ -1017,7 +1017,6 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
         return;
     }
     let numbered = matches!(v.source, Source::Album(_) | Source::Playlist(_) | Source::Liked | Source::Queue);
-    let queue = v.source == Source::Queue;
     scroll_into_view(v, h, with_scrolloff);
     let (scroll, sel) = (v.scroll, v.sel);
     let items: Vec<Item> = v.items.iter().skip(scroll).take(h).cloned().collect();
@@ -1030,9 +1029,19 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let name_w = rest * 11 / 20;
     let sub_w = rest.saturating_sub(name_w + 2);
 
+    let mut y = body.y;
     for (row, it) in items.iter().enumerate() {
         let idx = scroll + row;
-        let r = Rect::new(body.x, body.y + row as u16, body.width, 1);
+        if sections > 0 && (row == 0 || idx == local) {
+            let label = if idx < local { "Next in queue" } else { upcoming.as_deref().unwrap_or("") };
+            f.render_widget(
+                Line::styled(label, Style::new().fg(MUTED).bold()),
+                Rect::new(body.x, y, body.width, 1),
+            );
+            y += 1;
+        }
+        let r = Rect::new(body.x, y, body.width, 1);
+        y += 1;
         let is_sel = idx == sel;
         let playing = playing_uri.as_deref() == Some(it.uri.as_str()) && !it.uri.is_empty();
         let bg = if is_sel { SEL_BG } else { BG };
@@ -1077,9 +1086,8 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
         f.render_widget(line, r);
         app.hits.push((r, Hit::Row(idx)));
     }
-    if loading_more && items.len() < h {
-        let ry = body.y + items.len() as u16;
-        f.render_widget(Line::styled("    loading…", Style::new().fg(DIM)), Rect::new(body.x, ry, body.width, 1));
+    if loading_more && y < body.bottom() {
+        f.render_widget(Line::styled("    loading…", Style::new().fg(DIM)), Rect::new(body.x, y, body.width, 1));
     }
 }
 
