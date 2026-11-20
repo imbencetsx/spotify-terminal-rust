@@ -290,7 +290,7 @@ pub struct App {
     /// Graphics-protocol state per slot (only in `art = image` mode).
     pub protos: [Option<Art>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
-    thumbnails: HashMap<(String, u16, u16, bool), Thumbnail>,
+    thumbnails: HashMap<(String, u16, u16, crate::art::Style), Thumbnail>,
     pub hits: Vec<(Rect, Hit)>,
     pub pointer: Option<Position>,
     pub list_height: usize,
@@ -1701,8 +1701,7 @@ impl App {
     }
 
     pub fn thumbnail(&mut self, url: &str, w: u16, h: u16) -> Option<&Thumbnail> {
-        let softpixel = self.art == crate::art::Style::SoftPixel;
-        let key = (url.to_owned(), w, h, softpixel);
+        let key = (url.to_owned(), w, h, self.art);
         if !self.thumbnails.contains_key(&key) {
             let image = self.images.get(url)?;
             let bitmap = (self.picker.protocol_type() != ProtocolType::Halfblocks)
@@ -1712,7 +1711,7 @@ impl App {
                         image,
                         u32::from(w) * u32::from(font.width),
                         u32::from(h) * u32::from(font.height),
-                        softpixel,
+                        self.art,
                     );
                     self.picker.new_protocol(image, (w, h).into(), Resize::default()).ok()
                 })
@@ -1727,6 +1726,11 @@ impl App {
             self.thumbnails.insert(key.clone(), thumb);
         }
         self.thumbnails.get(&key)
+    }
+
+    pub fn uses_cover_bitmaps(&self) -> bool {
+        self.art != crate::art::Style::Dots
+            && self.picker.protocol_type() != ProtocolType::Halfblocks
     }
 
     pub fn cycle_art(&mut self) {
@@ -2168,6 +2172,68 @@ mod tests {
             panic!("expected terminal graphics for the thumbnail");
         };
         assert_eq!(image.size(), (4, 2).into());
+    }
+
+    #[test]
+    fn clicking_the_last_visible_song_or_lyric_keeps_its_position() {
+        let (mut app, _) = connected_app();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))
+            .expect("test terminal");
+        let mut playlist = app.new_view("Playlist", Source::Playlist("test".into()));
+        playlist.items = (0..50)
+            .map(|i| {
+                Item::new(
+                    Kind::Track,
+                    format!("spotify:track:{i}"),
+                    format!("Song {i}"),
+                )
+            })
+            .collect();
+        app.player.item = playlist.items.first().cloned();
+        app.push(playlist);
+
+        for source in [Source::Playlist("test".into()), Source::Lyrics] {
+            if source == Source::Lyrics {
+                app.toggle_lyrics();
+                app.lyrics.insert(
+                    "spotify:track:0".into(),
+                    crate::lyrics::State::Ready(crate::lyrics::Lyrics {
+                        synced: true,
+                        lines: (0..50)
+                            .map(|i| crate::lyrics::LyricLine {
+                                at_ms: i * 2_000,
+                                text: format!("Lyric {i}"),
+                            })
+                            .collect(),
+                    }),
+                );
+            }
+            let row_index = |hit: &Hit| match hit {
+                Hit::Row(i) if source != Source::Lyrics => Some(*i),
+                Hit::LyricLine(i) if source == Source::Lyrics => Some(*i),
+                _ => None,
+            };
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let (area, index) = app
+                .hits
+                .iter()
+                .rev()
+                .find_map(|(area, hit)| row_index(hit).map(|i| (*area, i)))
+                .unwrap();
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            assert_eq!(app.view().sel, index);
+            assert!(
+                app.hits
+                    .iter()
+                    .any(|(r, hit)| *r == area && row_index(hit) == Some(index))
+            );
+        }
     }
 
     #[test]

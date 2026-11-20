@@ -8,7 +8,7 @@ use ratatui::style::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Style {
-    /// Full-color half blocks at terminal resolution.
+    /// Size-aware pixel art, with half blocks when bitmaps aren't available.
     Pixel,
     /// A dot matrix: dot size follows brightness, dot colour follows the art.
     Dots,
@@ -128,13 +128,18 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
 }
 
 /// Downsample to a fine pixel grid and enlarge it without smoothing the edges.
-pub fn bitmap(img: &DynamicImage, width: u32, height: u32, softpixel: bool) -> DynamicImage {
-    if softpixel {
-        img.resize_exact(width.div_ceil(3), height.div_ceil(3), FilterType::Lanczos3)
-            .resize_exact(width, height, FilterType::Nearest)
-    } else {
-        img.resize_exact(width, height, FilterType::Lanczos3)
-    }
+pub fn bitmap(img: &DynamicImage, width: u32, height: u32, style: Style) -> DynamicImage {
+    let grid = |pixels: u32| {
+        // The extra samples give little covers enough detail to read without
+        // losing the chunky look. Larger covers get a finer grid overall.
+        match style {
+            Style::Pixel => pixels.min(5 + pixels / 6),
+            Style::SoftPixel => pixels.min(7 + pixels / 5),
+            Style::Image | Style::Dots => pixels,
+        }
+    };
+    img.resize_exact(grid(width), grid(height), FilterType::Lanczos3)
+        .resize_exact(width, height, FilterType::Nearest)
 }
 
 /// Use four color samples per cell when the terminal can't draw bitmap images.
@@ -378,12 +383,26 @@ mod tests {
         let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(12, 6, |x, y| {
             image::Rgb([(x * 20) as u8, (y * 40) as u8, 0])
         }));
-        let smooth = bitmap(&image, 12, 6, false).to_rgb8();
-        let soft = bitmap(&image, 12, 6, true).to_rgb8();
+        let smooth = bitmap(&image, 36, 18, Style::Image).to_rgb8();
+        let soft = bitmap(&image, 36, 18, Style::SoftPixel).to_rgb8();
         assert_eq!(soft.dimensions(), smooth.dimensions());
-        assert_ne!(smooth.get_pixel(0, 0), smooth.get_pixel(1, 0));
-        assert_eq!(soft.get_pixel(0, 0), soft.get_pixel(2, 2));
-        assert_ne!(soft.get_pixel(2, 2), soft.get_pixel(3, 2));
+        assert_eq!(soft.get_pixel(0, 0), soft.get_pixel(1, 0));
+        assert_ne!(soft.get_pixel(1, 0), soft.get_pixel(3, 0));
+        assert_ne!(smooth, soft);
+    }
+
+    #[test]
+    fn default_bitmap_uses_a_finer_grid_for_the_large_cover() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 16, |x, _| {
+            image::Rgb([x as u8, 0, 0])
+        }));
+        let samples = |size| {
+            let image = bitmap(&image, size, size, Style::Pixel).to_rgb8();
+            image.rows().next().expect("nonempty cover").map(|p| p.0[0])
+                .collect::<std::collections::HashSet<_>>().len()
+        };
+        assert_eq!(samples(32), 10);
+        assert_eq!(samples(360), 65);
     }
 
     #[test]

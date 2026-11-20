@@ -241,7 +241,7 @@ fn cover(f: &mut Frame, app: &mut App, r: Rect, slot: usize) {
         );
         return;
     }
-    if app.art == ArtStyle::SoftPixel && draw_cover_bitmap(f, app, r, &url) {
+    if app.uses_cover_bitmaps() && draw_cover_bitmap(f, app, r, &url) {
         return;
     }
     match app.rendered_art(&url, r.width, r.height) {
@@ -326,12 +326,10 @@ fn player(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
     let mut y = inner.y;
 
     if full {
-        // Leave room for the shadow, controls and the wrapped lyrics preview.
+        // Reserve preview space based on the pane height so changing lyrics
+        // cannot move the artwork and playback controls.
         let reserved = if app.lyrics_enabled() {
-            let preview_rows = lyrics_preview_lines(app).iter().fold(0u16, |rows, text| {
-                rows.saturating_add(lyric_preview_rows(*text, inner.width))
-            });
-            13u16.saturating_add(preview_rows.max(4))
+            13 + (inner.height / 5).clamp(4, 10)
         } else {
             14
         };
@@ -625,6 +623,7 @@ fn lyrics_page(f: &mut Frame, app: &mut App, area: Rect) {
     let current = lyrics.current(app.player.position());
     app.sync_lyrics_selection(current, synced);
     let selected = app.view().sel;
+    let first = app.view().scroll;
     let manual = app.lyrics_manual.is_some();
     let hint = match (synced, manual) {
         (true, true) => "Following paused  ·  Enter or click to seek",
@@ -648,6 +647,7 @@ fn lyrics_page(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(lyrics) = app.current_lyrics() else {
         return;
     };
+    let selected = selected.min(lyrics.lines.len().saturating_sub(1));
     let gutter = if synced { 8 } else { 2 };
     let text_width = area.width.saturating_sub(gutter);
     let paragraph = |i: usize| {
@@ -660,16 +660,26 @@ fn lyrics_page(f: &mut Frame, app: &mut App, area: Rect) {
             .style(style)
             .wrap(Wrap { trim: true })
     };
-    // Keep the active line near the middle and account for wrapped lines.
-    let mut first = selected;
-    let mut above = 0;
-    while first > 0 {
-        let height = paragraph(first - 1).line_count(text_width).max(1);
-        if above + height > area.height as usize / 2 {
-            break;
+    let rows = usize::from(area.height);
+    let selected_visible = selected >= first
+        && (first..selected)
+            .try_fold(0, |used, i| {
+                let used = used + paragraph(i).line_count(text_width).max(1);
+                (used < rows).then_some(used)
+            })
+            .is_some();
+    // Keep visible lines anchored. Follow playback when the active line leaves the pane.
+    let mut first = if selected_visible { first } else { selected };
+    if !selected_visible {
+        let mut above = 0;
+        while first > 0 {
+            let height = paragraph(first - 1).line_count(text_width).max(1);
+            if above + height > rows / 2 {
+                break;
+            }
+            first -= 1;
+            above += height;
         }
-        first -= 1;
-        above += height;
     }
     let mut y = area.y;
     let mut hits = Vec::new();
@@ -698,6 +708,7 @@ fn lyrics_page(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
     }
+    top(app).scroll = first;
     app.hits.extend(hits);
 }
 
@@ -829,8 +840,8 @@ fn header_block(f: &mut Frame, app: &mut App, r: Rect, h: &Item) -> u16 {
 }
 
 /// Keep the selection on screen with a little vim-style scrolloff.
-fn scroll_into_view(v: &mut View, h: usize) {
-    let so = 3.min(h / 3);
+fn scroll_into_view(v: &mut View, h: usize, with_scrolloff: bool) {
+    let so = if with_scrolloff { 3.min(h / 3) } else { 0 };
     if v.sel < v.scroll + so {
         v.scroll = v.sel.saturating_sub(so);
     }
@@ -905,10 +916,11 @@ fn rich_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
     let per = ((body.height + 1) / STEP).max(1) as usize;
     app.list_height = per;
+    let with_scrolloff = app.pointer.is_none();
     let v = top(app);
     let numbered = matches!(v.source, Source::Playlist(_) | Source::Liked | Source::Queue);
     let is_search = matches!(v.source, Source::Search { .. });
-    scroll_into_view(v, per);
+    scroll_into_view(v, per, with_scrolloff);
     let (scroll, sel) = (v.scroll, v.sel);
     let items: Vec<Item> = v.items.iter().skip(scroll).take(per).cloned().collect();
     let loading_more = v.loading && v.next.is_some();
@@ -1007,6 +1019,7 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     let playing_uri = app.player.item.as_ref().map(|i| i.uri.clone());
     let h = body.height as usize;
     let local = app.queued_len();
+    let with_scrolloff = app.pointer.is_none();
     let v = top(app);
     if v.items.is_empty() {
         let info = EmptyInfo { source: v.source.clone(), error: v.error.clone(), loading: v.loading, note: v.note.clone() };
@@ -1017,7 +1030,7 @@ fn plain_rows(f: &mut Frame, app: &mut App, body: Rect) {
     }
     let numbered = matches!(v.source, Source::Album(_) | Source::Playlist(_) | Source::Liked | Source::Queue);
     let queue = v.source == Source::Queue;
-    scroll_into_view(v, h);
+    scroll_into_view(v, h, with_scrolloff);
     let (scroll, sel) = (v.scroll, v.sel);
     let items: Vec<Item> = v.items.iter().skip(scroll).take(h).cloned().collect();
     let loading_more = v.loading && v.next.is_some();
@@ -1135,7 +1148,7 @@ fn playlists_grid(f: &mut Frame, app: &mut App, area: Rect) {
         let cover_r = Rect::new(x, y, cw, cover_h);
         match (&it.image, it.kind) {
             (_, Kind::Liked) => liked_cover(f, cover_r),
-            (Some(url), _) if matches!(app.art, ArtStyle::Image | ArtStyle::SoftPixel) => {
+            (Some(url), _) if app.uses_cover_bitmaps() => {
                 if !draw_cover_bitmap(f, app, cover_r, url) {
                     app.fetch_image(url.clone());
                     cover_placeholder(f, cover_r);

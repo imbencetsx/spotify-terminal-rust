@@ -96,7 +96,7 @@ The player loads lyrics automatically and previews the previous line, the curren
 The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
 Use `:art image` for smooth artwork at the terminal’s pixel resolution. `A` cycles styles, and `art = "…"` in the config sets the default.
-- `pixel` (default): full-color half blocks with smooth resampling.
+- `pixel` (default): pixel art scaled to the cover size. Tiny covers use a chunkier grid, and larger covers retain more detail. Terminals without image support use text blocks.
 - `dots`: a dot matrix, where dot size follows brightness.
 - `image`: the real picture, using kitty graphics in kitty and Ghostty or iTerm2 graphics in iTerm2 and WezTerm (`images = "…"` overrides this).
 - `softpixel`: bitmap covers with a fine pixel grid, drawn in the same space as `image`. Use `:art softpixel` to try it in the current session.
