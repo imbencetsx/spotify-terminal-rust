@@ -11,7 +11,7 @@ use image::DynamicImage;
 use ratatui::layout::{Position, Rect};
 use ratatui_image::Resize;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::{Protocol, StatefulProtocol};
+use ratatui_image::protocol::Protocol;
 use serde_json::{Value, json};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -237,11 +237,6 @@ struct QueueStart {
     since: Instant,
 }
 
-pub struct Art {
-    pub url: String,
-    pub proto: StatefulProtocol,
-}
-
 pub enum Thumbnail {
     Bitmap(Protocol),
     Text(crate::art::Rendered),
@@ -287,8 +282,6 @@ pub struct App {
     /// Cover url currently shown per slot (0 = now playing, 1 = list header).
     /// Lags the wanted url until its image has loaded, so covers don't flash.
     pub shown: [Option<String>; 2],
-    /// Graphics-protocol state per slot (only in `art = image` mode).
-    pub protos: [Option<Art>; 2],
     art_cache: HashMap<(String, u16, u16, crate::art::Style), crate::art::Rendered>,
     thumbnails: HashMap<(String, u16, u16, crate::art::Style), Thumbnail>,
     pub hits: Vec<(Rect, Hit)>,
@@ -363,7 +356,6 @@ impl App {
             pending_images: HashSet::new(),
             art: crate::art::Style::Pixel,
             shown: [None, None],
-            protos: [None, None],
             art_cache: HashMap::new(),
             thumbnails: HashMap::new(),
             hits: Vec::new(),
@@ -1670,19 +1662,6 @@ impl App {
             let first = self.backdrop.is_none();
             self.backdrop_old = std::mem::replace(&mut self.backdrop, new).map(|b| b.1);
             self.backdrop_mix = if first { 1.0 } else { 0.0 };
-        }
-        for i in 0..2 {
-            if self.art != crate::art::Style::Image {
-                self.protos[i] = None;
-                continue;
-            }
-            if self.protos[i].as_ref().map(|a| &a.url) == self.shown[i].as_ref() {
-                continue;
-            }
-            self.protos[i] = self.shown[i].as_ref().and_then(|u| {
-                let img = self.images.get(u)?;
-                Some(Art { proto: self.picker.new_resize_protocol(img.clone()), url: u.clone() })
-            });
         }
     }
 

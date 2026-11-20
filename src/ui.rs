@@ -2,17 +2,15 @@
 //! recorded into `app.hits` as we go.
 
 use crate::app::{App, Hit, Mode, SETUP_LABELS, Setup, SetupStage, Thumbnail, View};
-use crate::art::{BgMode as ArtBg, Style as ArtStyle};
+use crate::art::BgMode as ArtBg;
 use crate::lyrics;
 use crate::model::{Item, Kind, Source, fmt_ms, parse_query};
 use crate::soloist::Repeat;
-use image::imageops::FilterType;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
-use ratatui_image::{Resize, StatefulImage};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Default accent (Spotify green), used when nothing is playing.
@@ -231,16 +229,6 @@ fn cover(f: &mut Frame, app: &mut App, r: Rect, slot: usize) {
         cover_placeholder(f, r);
         return;
     };
-    if app.art == ArtStyle::Image
-        && let Some(a) = app.protos[slot].as_mut()
-    {
-        f.render_stateful_widget(
-            StatefulImage::default().resize(Resize::Scale(Some(FilterType::Lanczos3))),
-            r,
-            &mut a.proto,
-        );
-        return;
-    }
     if app.uses_cover_bitmaps() && draw_cover_bitmap(f, app, r, &url) {
         return;
     }

@@ -5,6 +5,7 @@ use image::imageops::FilterType;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Style {
@@ -80,6 +81,28 @@ fn rgb(p: &image::Rgb<u8>) -> Color {
     Color::Rgb(p[0], p[1], p[2])
 }
 
+/// Crop evenly from the sides or ends to match the display aspect ratio.
+fn center_crop(img: &DynamicImage, width: u32, height: u32) -> Cow<'_, DynamicImage> {
+    let (source_w, source_h) = (img.width(), img.height());
+    let (w, h) = (u64::from(width), u64::from(height));
+    let (source_width, source_height) = (u64::from(source_w), u64::from(source_h));
+    if w == 0 || h == 0 || source_w == 0 || source_h == 0 {
+        return Cow::Borrowed(img);
+    }
+    let crop_w = (source_height * w / h).clamp(1, source_width) as u32;
+    let crop_h = (source_width * h / w).clamp(1, source_height) as u32;
+    if (crop_w, crop_h) == (source_w, source_h) {
+        Cow::Borrowed(img)
+    } else {
+        Cow::Owned(img.crop_imm(
+            (source_w - crop_w) / 2,
+            (source_h - crop_h) / 2,
+            crop_w,
+            crop_h,
+        ))
+    }
+}
+
 /// Render `img` into `w`×`h` cells.
 pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
     let (w32, h32) = (w as u32, h as u32);
@@ -87,6 +110,7 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
     if w == 0 || h == 0 {
         return Rendered { w, h, cells };
     }
+    let img = center_crop(img, w32, h32 * 2);
     match style {
         Style::Pixel | Style::Image | Style::SoftPixel => {
             let small = img.resize_exact(w32, h32 * 2, FilterType::Lanczos3).to_rgb8();
@@ -138,7 +162,8 @@ pub fn bitmap(img: &DynamicImage, width: u32, height: u32, style: Style) -> Dyna
             Style::Image | Style::Dots => pixels,
         }
     };
-    img.resize_exact(grid(width), grid(height), FilterType::Lanczos3)
+    center_crop(img, width, height)
+        .resize_exact(grid(width), grid(height), FilterType::Lanczos3)
         .resize_exact(width, height, FilterType::Nearest)
 }
 
@@ -146,7 +171,9 @@ pub fn bitmap(img: &DynamicImage, width: u32, height: u32, style: Style) -> Dyna
 pub fn render_thumbnail(img: &DynamicImage, w: u16, h: u16) -> Rendered {
     let mut cells = Vec::with_capacity(w as usize * h as usize);
     if w > 0 && h > 0 {
-        let small = img.resize_exact(u32::from(w) * 2, u32::from(h) * 2, FilterType::Lanczos3).to_rgb8();
+        let small = center_crop(img, u32::from(w), u32::from(h) * 2)
+            .resize_exact(u32::from(w) * 2, u32::from(h) * 2, FilterType::Lanczos3)
+            .to_rgb8();
         for y in (0..small.height()).step_by(2) {
             for x in (0..small.width()).step_by(2) {
                 let samples = [
@@ -368,13 +395,13 @@ mod tests {
     fn tiny_cover_keeps_horizontal_detail_in_one_cell() {
         let red = image::Rgb([255, 0, 0]);
         let blue = image::Rgb([0, 0, 255]);
-        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 2, |x, _| {
-            if x == 0 { red } else { blue }
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, _| {
+            if x % 2 == 0 { red } else { blue }
         }));
-        let thumbnail = render_thumbnail(&img, 1, 1);
+        let thumbnail = render_thumbnail(&img, 2, 1);
         assert_eq!(
             thumbnail.cells,
-            [Cell { ch: '▌', fg: rgb(&red), bg: Some(rgb(&blue)) }],
+            [Cell { ch: '▌', fg: rgb(&red), bg: Some(rgb(&blue)) }; 2],
         );
     }
 
@@ -393,7 +420,7 @@ mod tests {
 
     #[test]
     fn default_bitmap_uses_a_finer_grid_for_the_large_cover() {
-        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 16, |x, _| {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 256, |x, _| {
             image::Rgb([x as u8, 0, 0])
         }));
         let samples = |size| {
@@ -403,6 +430,27 @@ mod tests {
         };
         assert_eq!(samples(32), 10);
         assert_eq!(samples(360), 65);
+    }
+
+    #[test]
+    fn wide_and_tall_covers_crop_to_the_center() {
+        let center = image::Rgb([30, 200, 60]);
+        let edge = image::Rgb([220, 40, 80]);
+        for (w, h) in [(32, 16), (16, 32)] {
+            let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                let long_axis = if w > h { x } else { y };
+                if (8..24).contains(&long_axis) { center } else { edge }
+            }));
+            for style in [Style::Pixel, Style::SoftPixel, Style::Image] {
+                let output = bitmap(&img, 32, 32, style).to_rgb8();
+                assert_eq!(output.dimensions(), (32, 32));
+                assert!(output.pixels().all(|p| *p == center));
+            }
+            for output in [render(&img, Style::Pixel, 4, 2), render_thumbnail(&img, 4, 2)] {
+                assert_eq!(output.cells.len(), 8);
+                assert!(output.cells.iter().all(|cell| cell.bg == Some(rgb(&center))));
+            }
+        }
     }
 
     #[test]
