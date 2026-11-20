@@ -1,20 +1,22 @@
-//! Album art drawn with text: chunky pixel art (half blocks) or a dot matrix.
-//! Fits the terminal look better than a photo, and works in every terminal.
+//! Album art drawn with full-color half blocks or a dot matrix.
 
 use image::DynamicImage;
 use image::imageops::FilterType;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Style {
-    /// Square pixels (half blocks) at full cell resolution, lightly posterized.
+    /// Size-aware pixel art, with half blocks when bitmaps aren't available.
     Pixel,
     /// A dot matrix: dot size follows brightness, dot colour follows the art.
     Dots,
     /// The real image via kitty / iTerm2 / sixel (falls back to half blocks).
     Image,
+    /// A bitmap with small, hard-edged pixels.
+    SoftPixel,
 }
 
 impl Style {
@@ -22,6 +24,7 @@ impl Style {
         match s {
             "dots" | "dot" | "matrix" => Style::Dots,
             "image" | "real" | "photo" => Style::Image,
+            "softpixel" => Style::SoftPixel,
             _ => Style::Pixel,
         }
     }
@@ -29,7 +32,8 @@ impl Style {
         match self {
             Style::Pixel => Style::Dots,
             Style::Dots => Style::Image,
-            Style::Image => Style::Pixel,
+            Style::Image => Style::SoftPixel,
+            Style::SoftPixel => Style::Pixel,
         }
     }
     pub fn name(self) -> &'static str {
@@ -37,6 +41,7 @@ impl Style {
             Style::Pixel => "pixel",
             Style::Dots => "dots",
             Style::Image => "image",
+            Style::SoftPixel => "softpixel",
         }
     }
 }
@@ -60,7 +65,7 @@ impl Rendered {
     pub fn draw(&self, area: Rect, buf: &mut Buffer) {
         for y in 0..self.h.min(area.height) {
             for x in 0..self.w.min(area.width) {
-                let c = self.cells[(y * self.w + x) as usize];
+                let c = self.cells[y as usize * self.w as usize + x as usize];
                 if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
                     cell.set_char(c.ch).set_fg(c.fg);
                     if let Some(bg) = c.bg {
@@ -72,42 +77,75 @@ impl Rendered {
     }
 }
 
-/// Snap a channel to a few levels: gives the retro, reduced-palette look.
-fn posterize(v: u8) -> u8 {
-    const LEVELS: f32 = 14.0;
-    ((v as f32 / 255.0 * LEVELS).round() / LEVELS * 255.0) as u8
+fn rgb(p: &image::Rgb<u8>) -> Color {
+    Color::Rgb(p[0], p[1], p[2])
 }
 
-fn rgb(p: image::Rgb<u8>, poster: bool) -> Color {
-    let f = |v| if poster { posterize(v) } else { v };
-    Color::Rgb(f(p[0]), f(p[1]), f(p[2]))
+/// Draw a digit halfway between the baselines of a two-row song card.
+pub fn track_digit(digit: usize, width: u32, height: u32, color: [u8; 3]) -> DynamicImage {
+    const GLYPHS: [u16; 10] = [
+        0b111_101_101_101_111, 0b010_110_010_010_111,
+        0b111_001_111_100_111, 0b111_001_111_001_111,
+        0b101_101_111_001_001, 0b111_100_111_001_111,
+        0b111_100_111_101_111, 0b111_001_010_010_010,
+        0b111_101_111_101_111, 0b111_101_111_001_111,
+    ];
+    let mut pixels = image::RgbaImage::new(width, height * 2);
+    let glyph_h = (height * 2 / 3).max(1);
+    let glyph_w = (glyph_h * 3 / 5).clamp(1, width);
+    let pixel = image::Rgba([color[0], color[1], color[2], 255]);
+    let x0 = (width - glyph_w) / 2;
+    let y0 = (height * 2 - glyph_h) / 2;
+    for y in 0..glyph_h {
+        for x in 0..glyph_w {
+            let bit = 14 - (y * 5 / glyph_h) * 3 - x * 3 / glyph_w;
+            if GLYPHS[digit] & (1 << bit) != 0 {
+                pixels.put_pixel(x0 + x, y0 + y, pixel);
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(pixels)
+}
+
+/// Crop evenly from the sides or ends to match the display aspect ratio.
+fn center_crop(img: &DynamicImage, width: u32, height: u32) -> Cow<'_, DynamicImage> {
+    let (source_w, source_h) = (img.width(), img.height());
+    let (w, h) = (u64::from(width), u64::from(height));
+    let (source_width, source_height) = (u64::from(source_w), u64::from(source_h));
+    if w == 0 || h == 0 || source_w == 0 || source_h == 0 {
+        return Cow::Borrowed(img);
+    }
+    let crop_w = (source_height * w / h).clamp(1, source_width) as u32;
+    let crop_h = (source_width * h / w).clamp(1, source_height) as u32;
+    if (crop_w, crop_h) == (source_w, source_h) {
+        Cow::Borrowed(img)
+    } else {
+        Cow::Owned(img.crop_imm(
+            (source_w - crop_w) / 2,
+            (source_h - crop_h) / 2,
+            crop_w,
+            crop_h,
+        ))
+    }
 }
 
 /// Render `img` into `w`×`h` cells.
 pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
     let (w32, h32) = (w as u32, h as u32);
-    let mut cells = Vec::with_capacity((w * h) as usize);
+    let mut cells = Vec::with_capacity(w as usize * h as usize);
+    if w == 0 || h == 0 {
+        return Rendered { w, h, cells };
+    }
+    let img = center_crop(img, w32, h32 * 2);
     match style {
-        Style::Pixel | Style::Image => {
-            // Each art pixel is k columns × k half-rows (= square on a 1:2 font).
-            // k grows only for very large covers, so art stays crisp but pixel-y.
-            let k = w32.div_ceil(72).max(1);
-            let (pw, ph) = ((w32 / k).max(1), ((h32 * 2) / k).max(1));
-            let small = img.resize_exact(pw, ph, FilterType::Triangle).to_rgb8();
-            // centre the grid when the area isn't a multiple of k
-            let (ox, oy) = ((w32 - (pw * k).min(w32)) / 2, (h32 * 2 - (ph * k).min(h32 * 2)) / 2);
-            let px = |x: u32, hy: u32| -> Option<Color> {
-                let (x, hy) = (x.checked_sub(ox)? / k, hy.checked_sub(oy)? / k);
-                (x < pw && hy < ph).then(|| rgb(*small.get_pixel(x, hy), true))
-            };
+        Style::Pixel | Style::Image | Style::SoftPixel => {
+            let small = img.resize_exact(w32, h32 * 2, FilterType::Lanczos3).to_rgb8();
             for y in 0..h32 {
                 for x in 0..w32 {
-                    let (top, bot) = (px(x, y * 2), px(x, y * 2 + 1));
-                    cells.push(match (top, bot) {
-                        (Some(t), Some(b)) => Cell { ch: '▀', fg: t, bg: Some(b) },
-                        (Some(t), None) => Cell { ch: '▀', fg: t, bg: None },
-                        (None, Some(b)) => Cell { ch: '▄', fg: b, bg: None },
-                        (None, None) => Cell { ch: ' ', fg: Color::Reset, bg: None },
+                    cells.push(Cell {
+                        ch: '▀',
+                        fg: rgb(small.get_pixel(x, y * 2)),
+                        bg: Some(rgb(small.get_pixel(x, y * 2 + 1))),
                     });
                 }
             }
@@ -137,6 +175,78 @@ pub fn render(img: &DynamicImage, style: Style, w: u16, h: u16) -> Rendered {
         }
     }
     Rendered { w, h, cells }
+}
+
+/// Downsample to a fine pixel grid and enlarge it without smoothing the edges.
+pub fn bitmap(img: &DynamicImage, width: u32, height: u32, style: Style) -> DynamicImage {
+    let grid = |pixels: u32| {
+        // The extra samples give little covers enough detail to read without
+        // losing the chunky look. Larger covers get a finer grid overall.
+        match style {
+            Style::Pixel => pixels.min(5 + pixels / 6),
+            Style::SoftPixel => pixels.min(7 + pixels / 5),
+            Style::Image | Style::Dots => pixels,
+        }
+    };
+    center_crop(img, width, height)
+        .resize_exact(grid(width), grid(height), FilterType::Lanczos3)
+        .resize_exact(width, height, FilterType::Nearest)
+}
+
+/// Use four color samples per cell when the terminal can't draw bitmap images.
+pub fn render_thumbnail(img: &DynamicImage, w: u16, h: u16) -> Rendered {
+    let mut cells = Vec::with_capacity(w as usize * h as usize);
+    if w > 0 && h > 0 {
+        let small = center_crop(img, u32::from(w), u32::from(h) * 2)
+            .resize_exact(u32::from(w) * 2, u32::from(h) * 2, FilterType::Lanczos3)
+            .to_rgb8();
+        for y in (0..small.height()).step_by(2) {
+            for x in (0..small.width()).step_by(2) {
+                let samples = [
+                    small.get_pixel(x, y).0,
+                    small.get_pixel(x + 1, y).0,
+                    small.get_pixel(x, y + 1).0,
+                    small.get_pixel(x + 1, y + 1).0,
+                ];
+                cells.push(quadrants(samples));
+            }
+        }
+    }
+    Rendered { w, h, cells }
+}
+
+fn quadrants(samples: [[u8; 3]; 4]) -> Cell {
+    // Each mask and its inverse represent the same split of foreground and background.
+    // Keep the split with the least RGB error.
+    const GLYPHS: [char; 8] = [' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛'];
+    let mut best = (u32::MAX, ' ', [[0; 3]; 2]);
+    for (mask, ch) in GLYPHS.into_iter().enumerate() {
+        let mut sums = [[0u16; 3]; 2];
+        let mut counts = [0u16; 2];
+        for (i, sample) in samples.iter().enumerate() {
+            let group = (mask >> i) & 1;
+            counts[group] += 1;
+            for (sum, value) in sums[group].iter_mut().zip(sample) {
+                *sum += u16::from(*value);
+            }
+        }
+        let mut colors = [[0u8; 3]; 2];
+        for group in 0..2 {
+            colors[group] = sums[group].map(|sum| (sum / counts[group].max(1)) as u8);
+        }
+        let mut error = 0;
+        for (i, sample) in samples.iter().enumerate() {
+            for (&value, mean) in sample.iter().zip(colors[(mask >> i) & 1]) {
+                let difference = u32::from(value.abs_diff(mean));
+                error += difference * difference;
+            }
+        }
+        if error < best.0 {
+            best = (error, ch, colors);
+        }
+    }
+    let (_, ch, [[r, g, b], [fr, fg, fb]]) = best;
+    Cell { ch, fg: Color::Rgb(fr, fg, fb), bg: Some(Color::Rgb(r, g, b)) }
 }
 
 fn hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -308,6 +418,68 @@ mod tests {
     }
 
     #[test]
+    fn tiny_cover_keeps_horizontal_detail_in_one_cell() {
+        let red = image::Rgb([255, 0, 0]);
+        let blue = image::Rgb([0, 0, 255]);
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |x, _| {
+            if x % 2 == 0 { red } else { blue }
+        }));
+        let thumbnail = render_thumbnail(&img, 2, 1);
+        assert_eq!(
+            thumbnail.cells,
+            [Cell { ch: '▌', fg: rgb(&red), bg: Some(rgb(&blue)) }; 2],
+        );
+    }
+
+    #[test]
+    fn softpixel_bitmap_keeps_its_size_and_has_hard_pixel_edges() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(12, 6, |x, y| {
+            image::Rgb([(x * 20) as u8, (y * 40) as u8, 0])
+        }));
+        let smooth = bitmap(&image, 36, 18, Style::Image).to_rgb8();
+        let soft = bitmap(&image, 36, 18, Style::SoftPixel).to_rgb8();
+        assert_eq!(soft.dimensions(), smooth.dimensions());
+        assert_eq!(soft.get_pixel(0, 0), soft.get_pixel(1, 0));
+        assert_ne!(soft.get_pixel(1, 0), soft.get_pixel(3, 0));
+        assert_ne!(smooth, soft);
+    }
+
+    #[test]
+    fn default_bitmap_uses_a_finer_grid_for_the_large_cover() {
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(256, 256, |x, _| {
+            image::Rgb([x as u8, 0, 0])
+        }));
+        let samples = |size| {
+            let image = bitmap(&image, size, size, Style::Pixel).to_rgb8();
+            image.rows().next().expect("nonempty cover").map(|p| p.0[0])
+                .collect::<std::collections::HashSet<_>>().len()
+        };
+        assert_eq!(samples(32), 10);
+        assert_eq!(samples(360), 65);
+    }
+
+    #[test]
+    fn wide_and_tall_covers_crop_to_the_center() {
+        let center = image::Rgb([30, 200, 60]);
+        let edge = image::Rgb([220, 40, 80]);
+        for (w, h) in [(32, 16), (16, 32)] {
+            let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                let long_axis = if w > h { x } else { y };
+                if (8..24).contains(&long_axis) { center } else { edge }
+            }));
+            for style in [Style::Pixel, Style::SoftPixel, Style::Image] {
+                let output = bitmap(&img, 32, 32, style).to_rgb8();
+                assert_eq!(output.dimensions(), (32, 32));
+                assert!(output.pixels().all(|p| *p == center));
+            }
+            for output in [render(&img, Style::Pixel, 4, 2), render_thumbnail(&img, 4, 2)] {
+                assert_eq!(output.cells.len(), 8);
+                assert!(output.cells.iter().all(|cell| cell.bg == Some(rgb(&center))));
+            }
+        }
+    }
+
+    #[test]
     fn dots_ramp() {
         let black = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
         assert!(render(&black, Style::Dots, 4, 2).cells.iter().all(|c| c.ch == '·'));
@@ -350,7 +522,7 @@ mod tests {
 
     #[test]
     fn styles_cycle() {
-        assert_eq!(Style::Pixel.next().next().next(), Style::Pixel);
+        assert_eq!(Style::Pixel.next().next().next().next(), Style::Pixel);
         assert_eq!(Style::parse("dots"), Style::Dots);
         assert_eq!(Style::parse("whatever"), Style::Pixel);
     }

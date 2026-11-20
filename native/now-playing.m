@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <MediaPlayer/MediaPlayer.h>
+#include <libproc.h>
+#include <unistd.h>
 
 static AVAudioEngine *engine;
 static AVAudioPlayerNode *node;
@@ -150,10 +152,78 @@ static void update(NSDictionary *state) {
     }
 }
 
-int main(void) {
+static NSURL *terminalBundle(void) {
+    for (pid_t pid = getppid(); pid > 1;) {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if ([app.bundleURL.pathExtension isEqualToString:@"app"]) return app.bundleURL;
+        struct proc_bsdinfo info;
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)
+            || info.pbi_ppid == (uint32_t)pid) break;
+        pid = info.pbi_ppid;
+    }
+
+    NSDictionary *env = NSProcessInfo.processInfo.environment;
+    NSString *program = [env[@"TERM_PROGRAM"] lowercaseString];
+    NSDictionary *terminals = @{
+        @"bmux": @"dev.bmux.app",
+        @"[bmux]": @"dev.bmux.app",
+        @"ghostty": @"com.mitchellh.ghostty",
+        @"apple_terminal": @"com.apple.Terminal",
+        @"iterm.app": @"com.googlecode.iterm2",
+        @"wezterm": @"com.github.wez.wezterm",
+        @"kitty": @"net.kovidgoyal.kitty",
+        @"warpterminal": @"dev.warp.Warp-Stable",
+    };
+    NSString *identifier = terminals[program ?: @""] ?: env[@"__CFBundleIdentifier"];
+    return identifier.length
+        ? [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:identifier]
+        : nil;
+}
+
+static int printTerminalIcon(void) {
+    NSURL *bundle = terminalBundle();
+    if (!bundle) return 1;
+    NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:bundle.path];
+    NSRect proposed = NSMakeRect(0, 0, 256, 256);
+    CGImageRef image = [icon CGImageForProposedRect:&proposed context:nil hints:nil];
+    if (!image) return 1;
+    CGColorSpaceRef color = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef context = CGBitmapContextCreate(NULL, 256, 256, 8, 0, color, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(color);
+    if (!context) return 1;
+    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+    CGContextDrawImage(context, CGRectMake(0, 0, 256, 256), image);
+    CGImageRef scaled = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    if (!scaled) return 1;
+    NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithCGImage:scaled];
+    CGImageRelease(scaled);
+    NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    if (!png.length) return 1;
+
+    // A single 256px PNG record is sufficient for macOS's small app badge.
+    uint32_t length = (uint32_t)png.length;
+    uint32_t total = CFSwapInt32HostToBig(length + 16);
+    uint32_t record = CFSwapInt32HostToBig(length + 8);
+    fwrite("icns", 1, 4, stdout);
+    fwrite(&total, 4, 1, stdout);
+    fwrite("ic08", 1, 4, stdout);
+    fwrite(&record, 4, 1, stdout);
+    return fwrite(png.bytes, 1, png.length, stdout) == png.length ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
     @autoreleasepool {
+        if (argc == 2 && strcmp(argv[1], "--terminal-icon") == 0) {
+            return printTerminalIcon();
+        }
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        NSString *iconPath = [NSBundle.mainBundle pathForResource:@"Terminal" ofType:@"icns"];
+        if (iconPath) {
+            NSImage *icon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+            if (icon) app.applicationIconImage = icon;
+        }
         registerCommands();
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             char *line = NULL;

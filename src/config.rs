@@ -2,6 +2,41 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaylistSort {
+    #[default]
+    Spotify,
+    Name,
+    Tracks,
+}
+
+impl PlaylistSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Spotify => Self::Name,
+            Self::Name => Self::Tracks,
+            Self::Tracks => Self::Spotify,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Spotify => "spotify",
+            Self::Name => "name",
+            Self::Tracks => "tracks",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spotify => "Spotify",
+            Self::Name => "A–Z",
+            Self::Tracks => "Most songs",
+        }
+    }
+}
+
 #[derive(Deserialize, Default, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
@@ -9,16 +44,17 @@ pub struct Config {
     pub client_id: Option<String>,
     /// Port for the OAuth callback (`http://127.0.0.1:<port>/callback`).
     pub redirect_port: Option<u16>,
-    /// Album art look: pixel | dots | image
+    /// Album art look: pixel | dots | image | softpixel
     pub art: Option<String>,
     /// Player background: spin | still | off
     pub background: Option<String>,
-    /// For `art = "image"`: auto | kitty | iterm | sixel | halfblocks | query
+    /// Image protocol for thumbnails and bitmap art.
     pub images: Option<String>,
     /// Look up lyrics on lrclib.net (sends the song's title/artist/album/length).
     pub lyrics: Option<bool>,
     /// Publish playback state and controls to macOS Now Playing.
     pub now_playing: Option<bool>,
+    pub playlist_sort: PlaylistSort,
     pub soloist: SoloistCfg,
 }
 
@@ -46,17 +82,20 @@ pub const TEMPLATE: &str = r#"# str — config
 # client_id = "your-client-id"
 # redirect_port = 8898
 
-# Album art: pixel (default) | dots | image   (A cycles it in the app)
+# Album art: pixel (default) | dots | image | softpixel   (A cycles it in the app)
 # art = "pixel"
 # Player background, a blurred copy of the cover: spin (default) | still | off
 # background = "spin"
-# For art = "image": auto | kitty | iterm | sixel | halfblocks | query
+# Image protocol for thumbnails and bitmap art:
+# auto | kitty | iterm | sixel | halfblocks | query
 # images = "auto"
-# Lyrics (L) come from lrclib.net, which gets the playing song's title,
-# artist, album and length. Turn off with:
+# The lyrics preview looks up the active song's title, artist, album
+# and length on lrclib.net. Turn off with:
 # lyrics = false
 # Use macOS Control Center and media keys:
 # now_playing = true
+# Home playlist order: spotify | name | tracks
+# playlist_sort = "spotify"
 
 [soloist]
 # 2. Playback goes through Spotify Soloist's WebSocket API.
@@ -82,6 +121,24 @@ pub fn dir() -> PathBuf {
 
 pub fn path() -> PathBuf {
     dir().join("config.toml")
+}
+
+pub fn load_playlist_pins() -> Result<Vec<crate::model::Item>> {
+    let path = dir().join("playlist-pins.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("reading playlist pins"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).context("reading playlist pins"),
+    }
+}
+
+pub fn save_playlist_pins(pins: &[crate::model::Item]) -> Result<()> {
+    let dir = dir();
+    std::fs::create_dir_all(&dir)?;
+    let temp = dir.join(format!("playlist-pins.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(pins)?;
+    std::fs::write(&temp, bytes).context("writing playlist pins")?;
+    std::fs::rename(&temp, dir.join("playlist-pins.json")).context("saving playlist pins")
 }
 
 /// The config path for showing to humans (`~/…`).

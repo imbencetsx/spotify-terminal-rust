@@ -69,37 +69,56 @@ Press `/` and type. Results update live. Start the query with a prefix to filter
 | `Tab` | queue | `H` | library |
 | `K` `J` | move the selected queued song up or down | `Ctrl+C` | quit and stop playback |
 | `P` | play the open album or playlist | `?` | help |
+| `L` | show or hide lyrics | `⏎` on a synced lyric | seek to that line |
 
 Commands work like vim: `:vol 50`, `:seek 1:23`, `:shuffle on`, `:repeat track`, `:play spotify:album:…`, `:q`.
 
 Click a cover tile to open it or a song to play it. In the queue, click to select and double-click to play. Click the progress bar to seek. Use the scroll wheel on the volume bar to change volume. The ⇄ ⏮ ⏸ ⏭ ↻ buttons are clickable.
 
+Select a playlist or open it and type `:pin` to pin it to the top of the home grid. Pinned playlists show a star and are saved locally. Use `:pin` again or `:unpin` to remove a pin.
+
+Click **Sort** on Home or type `:sort` to cycle through Spotify order, A–Z, and most songs. Use `:sort spotify`, `:sort name`, or `:sort tracks` to choose directly. Pins stay at the top and the sort setting is saved.
+
 ### Queue
 
-Press `a` to add a song to the current `str` session. Open the queue with `Tab` and move a song with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. The `↕` marks editable rows. These songs play in order before Spotify’s upcoming tracks. Playing a queued song through Soloist can change the active album or playlist context. Spotify’s own upcoming rows are read-only.
+Press `a` to add a song to the queue and `Tab` to see what’s next. **Next in queue** lists songs you added. Move them with `K` / `J`, Shift+Up / Shift+Down, or the arrow buttons. They play before the tracks listed under **Next from**.
+
+Press `p` to go back through the songs played since you opened `str`. When a song in your history ends, playback returns through the songs you just left before continuing the queue or collection. The queue shows those returning songs under **Resume playback**.
+
+Click **Clear queue** or type `:clearqueue` to remove songs added in `str`. The active collection and songs queued in Spotify stay in place.
+
+Click a track in an album, playlist, or Liked Songs to start there. The collection continues in order or shuffled, according to the shuffle toggle. Clicking a search result plays that track on its own and Soloist handles subsequent autoplay if available.
 
 Quitting the player stops a Soloist process it started. If you started Soloist separately, quitting pauses playback on that device and leaves the daemon running.
 
+### Lyrics
+
+Press `L` or click **Lyrics** in the player. Synced lyrics highlight the current line and follow playback. Scroll or use `j` / `k` to read ahead. Click a timed line or press Enter to seek to it. Plain lyrics can be scrolled when synced lyrics are unavailable.
+
+The player loads lyrics automatically and previews the previous line, the current line, and the next two lines when synced lyrics are available. Lookups send the song’s title, artist, album, and duration to [LRCLIB](https://lrclib.net/docs). Set `lyrics = false` at the top level of your config to disable lookups.
+
 ### macOS Now Playing
 
-The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
+The player publishes the current track, artwork, progress, and available controls to macOS Now Playing. The small app badge uses the launching terminal’s icon when macOS can identify it. Control Center and the media keys can play, pause, seek, and skip. A menu-bar or notch widget can show the track if it uses the system Now Playing session. Set `now_playing = false` in the top level of your config to turn this off.
 
-Album art is drawn as text so it fits the terminal. `A` cycles the style, and `art = "…"` in the config sets the default:
-- `pixel` (default): chunky square pixels with a reduced palette.
+Use `:art image` for smooth artwork at the terminal’s pixel resolution. `A` cycles styles, and `art = "…"` in the config sets the default.
+- `pixel` (default): pixel art scaled to the cover size. Tiny covers use a chunkier grid, and larger covers retain more detail. Terminals without image support use text blocks.
 - `dots`: a dot matrix, where dot size follows brightness.
 - `image`: the real picture, using kitty graphics in kitty and Ghostty or iTerm2 graphics in iTerm2 and WezTerm (`images = "…"` overrides this).
+- `softpixel`: bitmap covers with a fine pixel grid, drawn in the same space as `image`. Use `:art softpixel` to try it in the current session.
+
+List thumbnails use terminal graphics when available. Other terminals use a denser text rendering in the same four columns by two rows.
 
 ### Spotify API limits (Feb 2026 dev-mode rules)
 
 - Search returns 10 results per page. `str` loads more pages as you scroll.
 - Spotify only lists the songs of playlists you own. Other playlists still play with `⏎`.
-- Clicking a song or pressing `⏎` on it plays that exact song, then queues the following loaded songs. Use the album or playlist’s Play button or `P` to start the full collection in order or shuffled, according to the shuffle toggle.
 
 ## Develop
 
 ```sh
 cargo run --example mock_soloist -- /tmp/fake-soloist   # fake Soloist + fake Web API
 # then, using the printed STR_API_BASE, with [soloist] data_dir = "/tmp/fake-soloist":
-STR_API_BASE=http://127.0.0.1:PORT/v1 cargo run
+STR_API_BASE=http://127.0.0.1:PORT/v1 STR_LYRICS_BASE=http://127.0.0.1:PORT/lyrics cargo run
 cargo test
 ```

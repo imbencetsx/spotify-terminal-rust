@@ -155,6 +155,15 @@ async fn main() {
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
             let (ctype, body) = if let Some(rest) = path.strip_prefix("/cover") {
                 ("image/png", cover(rest[..1].parse().unwrap_or(0)))
+            } else if path.starts_with("/lyrics/") {
+                let record = if path.contains("Midnight") {
+                    json!({"syncedLyrics": "[00:00.00]The last tram hums\n[00:30.00]Windows catch the rain as the last passengers watch the river disappear\n[01:00.00]Streetlights drift across the glass\n[01:30.00]The city slips away", "duration": 214})
+                } else if path.contains("Paper") {
+                    json!({"plainLyrics": "A paper moon\nAbove the quiet road", "duration": 187})
+                } else {
+                    json!({"instrumental": true, "duration": 241})
+                };
+                ("application/json", record.to_string().into_bytes())
             } else {
                 ("application/json", web_api(&base, &path).to_string().into_bytes())
             };
