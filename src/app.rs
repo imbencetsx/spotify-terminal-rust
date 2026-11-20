@@ -259,6 +259,7 @@ struct TrackStart {
     from: Option<Item>,
     from_cursor: Option<usize>,
     since: Instant,
+    refresh_requested: bool,
 }
 
 struct PlayedTrack {
@@ -271,6 +272,7 @@ struct PlayedTrack {
 struct ManualAdvance {
     since: Instant,
     expected_uri: Option<String>,
+    refresh_requested: bool,
 }
 
 pub enum Thumbnail {
@@ -292,6 +294,7 @@ pub struct App {
     queue_revision: u64,
     context: Option<PlaybackContext>,
     queue_start: Option<TrackStart>,
+    deferred_skip: i8,
     queue_history: Vec<PlayedTrack>,
     queue_retry_blocked: bool,
     manual_advance: Option<ManualAdvance>,
@@ -373,6 +376,7 @@ impl App {
             queue_revision: 0,
             context: None,
             queue_start: None,
+            deferred_skip: 0,
             queue_history: Vec::new(),
             queue_retry_blocked: false,
             manual_advance: None,
@@ -731,6 +735,7 @@ impl App {
         if !self.send("play", json!({ "uri": track.uri })) {
             return false;
         }
+        self.manual_advance = None;
         self.queue_retry_blocked = false;
         self.queue_start = Some(TrackStart {
             track,
@@ -738,6 +743,7 @@ impl App {
             from: self.player.item.clone(),
             from_cursor: self.context.as_ref().map(|context| context.cursor),
             since: Instant::now(),
+            refresh_requested: false,
         });
         true
     }
@@ -916,6 +922,7 @@ impl App {
         }
         self.shuffle_preference = Some(shuffle);
         self.queue_history.clear();
+        self.deferred_skip = 0;
         self.restore_queue_start();
         self.context = None;
         self.refresh_queue_views();
@@ -944,7 +951,11 @@ impl App {
     }
 
     fn next(&mut self) {
-        if self.queue_start.is_none() && !self.advance_followup() {
+        if self.skip_waiting() {
+            self.deferred_skip = self.deferred_skip.saturating_add(1);
+            return;
+        }
+        if !self.advance_followup() {
             self.context = None;
             self.refresh_queue_views();
             self.mark_manual_advance(None);
@@ -987,7 +998,8 @@ impl App {
     }
 
     fn prev(&mut self) {
-        if self.queue_start.is_some() {
+        if self.skip_waiting() {
+            self.deferred_skip = self.deferred_skip.saturating_sub(1);
             return;
         }
         self.mark_manual_advance(None);
@@ -1040,7 +1052,25 @@ impl App {
         self.manual_advance = Some(ManualAdvance {
             since: Instant::now(),
             expected_uri,
+            refresh_requested: false,
         });
+    }
+
+    fn skip_waiting(&self) -> bool {
+        self.queue_start.is_some()
+            || self
+                .context
+                .as_ref()
+                .is_some_and(|context| context.advance_on_load)
+            || self.manual_advance.as_ref().is_some_and(|advance| {
+                advance.since.elapsed() < Duration::from_secs(3)
+                    && advance.expected_uri.as_deref().is_some_and(|expected| {
+                        self.player
+                            .item
+                            .as_ref()
+                            .is_none_or(|item| item.uri != expected)
+                    })
+            })
     }
 
     pub fn shuffle_enabled(&self) -> bool {
@@ -1516,6 +1546,7 @@ impl App {
                 self.player.logged_in = false;
                 self.player.queue.clear();
                 self.queue_history.clear();
+                self.deferred_skip = 0;
                 self.player.down_reason = r;
                 self.restore_queue_start();
                 self.refresh_queue_views();
@@ -1663,12 +1694,16 @@ impl App {
                         }
                         self.refresh_queue_views();
                         self.load_context_page();
-                        if advance && !self.advance_followup() {
+                        if advance {
                             self.next();
+                            if !self.skip_waiting() {
+                                self.flush_deferred_skip();
+                            }
                         }
                     }
                     Err(e) => {
                         active.next_page = None;
+                        self.deferred_skip = 0;
                         self.refresh_queue_views();
                         self.error(format!("Couldn’t load the rest of the collection: {e}"));
                     }
@@ -1709,10 +1744,19 @@ impl App {
             .filter(|uri| !uri.is_empty());
         let track_changed =
             next_uri.is_some() && next_uri != self.player.item.as_ref().map(|i| i.uri.as_str());
+        let expected_context_track = next_uri.is_some_and(|uri| {
+            self.context
+                .as_ref()
+                .is_some_and(|context| context.tracks[context.cursor].uri == uri)
+                || self
+                    .queue_history
+                    .last()
+                    .is_some_and(|entry| entry.uri == uri)
+        });
         let duration = self.player.duration();
-        let finishing = self.player.playing()
-            && duration > 0
-            && self.player.position().saturating_add(350) >= duration;
+        let was_playing = self.player.playing();
+        let finishing =
+            was_playing && duration > 0 && self.player.position().saturating_add(350) >= duration;
         let finishing_track = finishing.then(|| self.player.item.clone()).flatten();
         let was_starting = self.queue_start.is_some();
         match self.player.apply(&event) {
@@ -1724,16 +1768,20 @@ impl App {
             Change::Error(e) => self.error(e),
             Change::Other => {}
         }
-        if self.queue_start.as_ref().is_some_and(|start| {
+        let start_confirmed = self.queue_start.as_ref().is_some_and(|start| {
+            let fresh_track = start
+                .from
+                .as_ref()
+                .is_none_or(|from| from.uri != start.track.uri);
             self.player
                 .item
                 .as_ref()
                 .is_some_and(|i| i.uri == start.track.uri)
                 && (kind == "track_changed"
-                    || (matches!(kind, "position_sync" | "playback_state")
-                        && self.player.pos_ms < 1_000))
-        }) && let Some(start) = self.queue_start.take()
-        {
+                    || (kind == "playback_state" && (fresh_track || self.player.pos_ms < 1_000))
+                    || (kind == "position_sync" && self.player.pos_ms < 1_000))
+        });
+        if start_confirmed && let Some(start) = self.queue_start.take() {
             let shuffle = self.shuffle_enabled();
             if let TrackOrigin::Context(index) = start.origin
                 && let Some(context) = self.context.as_mut()
@@ -1758,15 +1806,15 @@ impl App {
             .manual_advance
             .as_ref()
             .is_some_and(|advance| advance.since.elapsed() < Duration::from_secs(3));
-        if let Some(uri) = next_uri
-            && self
-                .manual_advance
+        let manual_confirmed = next_uri.is_some_and(|uri| {
+            self.manual_advance
                 .as_ref()
                 .is_some_and(|advance| match &advance.expected_uri {
                     Some(expected) => expected == uri,
                     None => track_changed,
                 })
-        {
+        });
+        if manual_confirmed {
             self.manual_advance = None;
         }
         if track_changed {
@@ -1776,10 +1824,13 @@ impl App {
                 view.scroll = 0;
             }
         }
-        if finishing
-            && (track_changed
-                || matches!(self.player.status.as_str(), "idle" | "stopped")
-                || (kind == "playback_changed" && self.player.position() >= duration))
+        let reached_end = was_playing
+            && !self.player.playing()
+            && duration > 0
+            && self.player.position() >= duration;
+        if ((finishing
+            && (track_changed || matches!(self.player.status.as_str(), "idle" | "stopped")))
+            || reached_end)
             && !was_starting
             && !manually_changed
             && self.can_auto_advance()
@@ -1788,9 +1839,33 @@ impl App {
             if let (Some(start), Some(previous)) = (self.queue_start.as_mut(), finishing_track) {
                 start.from = Some(previous);
             }
-        } else if track_changed && !was_starting && !manually_changed && self.context.is_some() {
+        } else if kind == "track_changed"
+            && track_changed
+            && !was_starting
+            && !manually_changed
+            && !expected_context_track
+            && self.context.is_some()
+        {
             self.context = None;
             self.refresh_queue_views();
+        }
+        if (start_confirmed || manual_confirmed) && !self.skip_waiting() {
+            self.flush_deferred_skip();
+        }
+    }
+
+    fn flush_deferred_skip(&mut self) {
+        let skips = std::mem::take(&mut self.deferred_skip);
+        for remaining in (0..skips.unsigned_abs()).rev() {
+            if skips > 0 {
+                self.next();
+            } else {
+                self.prev();
+            }
+            if self.skip_waiting() {
+                self.deferred_skip = remaining as i8 * skips.signum();
+                break;
+            }
         }
     }
 
@@ -1810,15 +1885,37 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.poll_soloist();
+        if let Some(advance) = &mut self.manual_advance
+            && advance.expected_uri.is_some()
+        {
+            if advance.since.elapsed() >= Duration::from_secs(3) {
+                self.manual_advance = None;
+                if self.queue_start.is_none() {
+                    self.deferred_skip = 0;
+                }
+            } else if !advance.refresh_requested
+                && advance.since.elapsed() >= Duration::from_millis(400)
+            {
+                advance.refresh_requested = true;
+                self.send("get_state", Value::Null);
+            }
+        }
         if self
             .queue_start
             .as_ref()
             .is_some_and(|s| s.since.elapsed() >= Duration::from_secs(5))
         {
             self.restore_queue_start();
+            self.deferred_skip = 0;
             if self.queue_retry_blocked {
                 self.error("Soloist didn’t start the next song. Press n to retry.");
             }
+        } else if let Some(start) = &mut self.queue_start
+            && !start.refresh_requested
+            && start.since.elapsed() >= Duration::from_millis(400)
+        {
+            start.refresh_requested = true;
+            self.send("get_state", Value::Null);
         }
         let duration = self.player.duration();
         if self.can_auto_advance()
@@ -1841,7 +1938,11 @@ impl App {
             self.spin = (self.spin + std::f32::consts::TAU / 40.0 * 0.2) % std::f32::consts::TAU;
         }
         let (a, t) = (self.accent, self.accent_target);
-        self.accent = (a.0 + (t.0 - a.0) * 0.3, a.1 + (t.1 - a.1) * 0.3, a.2 + (t.2 - a.2) * 0.3);
+        self.accent = (
+            a.0 + (t.0 - a.0) * 0.3,
+            a.1 + (t.1 - a.1) * 0.3,
+            a.2 + (t.2 - a.2) * 0.3,
+        );
         if self.backdrop_mix < 1.0 {
             self.backdrop_mix = (self.backdrop_mix + 0.2).min(1.0);
             if self.backdrop_mix >= 1.0 {
@@ -2718,6 +2819,7 @@ mod tests {
         app.activate();
         expect_play(&mut commands, "spotify:track:search");
         assert!(app.context.is_none());
+        track_changed(&mut app, "spotify:track:search");
         app.next();
         assert!(matches!(
             commands.try_recv().unwrap(),
@@ -2786,6 +2888,95 @@ mod tests {
         assert!(matches!(
             commands.try_recv().unwrap(),
             soloist::Request::Send(play) if play == soloist::command("play", json!({"uri": "spotify:track:second"}))
+        ));
+    }
+
+    #[test]
+    fn rapid_next_presses_are_kept_until_the_pending_track_confirms() {
+        let (mut app, mut commands) = connected_app();
+        let mut view = app.new_view("Album", Source::Album("test".into()));
+        view.items = (0..4)
+            .map(|i| {
+                Item::new(
+                    Kind::Track,
+                    format!("spotify:track:{i}"),
+                    format!("Song {i}"),
+                )
+            })
+            .collect();
+        app.player.item = view.items.first().cloned();
+        app.push(view);
+        app.activate();
+        let _ = commands.try_recv().unwrap();
+
+        app.next();
+        app.next();
+        assert!(
+            matches!(commands.try_recv().unwrap(), soloist::Request::Send(play) if play["uri"] == "spotify:track:1")
+        );
+        app.queue_start.as_mut().unwrap().since -= Duration::from_millis(500);
+        app.on_tick();
+        assert!(
+            matches!(commands.try_recv().unwrap(), soloist::Request::Send(query) if query["command"] == "get_state")
+        );
+        app.on_tick();
+        assert!(commands.try_recv().is_err());
+        app.on_player_event(json!({
+            "type": "playback_state", "status": "playing",
+            "item": {"uri": "spotify:track:1", "entity_type": "track"},
+            "position": {"position_ms": 1_200, "speed": 1}
+        }));
+        assert!(
+            matches!(commands.try_recv().unwrap(), soloist::Request::Send(play) if play["uri"] == "spotify:track:2")
+        );
+    }
+
+    #[test]
+    fn previous_bypasses_a_track_only_started_between_rapid_skips() {
+        let (mut app, mut commands) = connected_app();
+        let mut view = app.new_view("Album", Source::Album("test".into()));
+        view.items = (0..3)
+            .map(|i| Item::new(Kind::Track, format!("spotify:track:{i}"), format!("Song {i}")))
+            .collect();
+        app.player.item = view.items.first().cloned();
+        app.push(view);
+        app.activate();
+        let _ = commands.try_recv().unwrap();
+
+        app.next();
+        app.next();
+        let _ = commands.try_recv().unwrap();
+        for track in ["spotify:track:1", "spotify:track:2"] {
+            app.on_player_event(json!({
+                "type": "track_changed",
+                "item": {"uri": track, "entity_type": "track"}
+            }));
+        }
+        let _ = commands.try_recv().unwrap();
+        app.prev();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            soloist::Request::Send(play) if play["uri"] == "spotify:track:0"
+        ));
+    }
+
+    #[test]
+    fn previous_from_a_selected_album_track_stays_in_the_album() {
+        let (mut app, mut commands) = connected_app();
+        let mut view = app.new_view("Album", Source::Album("test".into()));
+        view.items = vec![
+            Item::new(Kind::Track, "spotify:track:first", "First"),
+            Item::new(Kind::Track, "spotify:track:second", "Second"),
+        ];
+        app.player.item = view.items.last().cloned();
+        app.push(view);
+        app.select(1);
+        app.activate();
+        let _ = commands.try_recv().unwrap();
+        app.prev();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            soloist::Request::Send(play) if play["uri"] == "spotify:track:first"
         ));
     }
 }
