@@ -267,6 +267,7 @@ struct PlayedTrack {
     previous: Item,
     origin: TrackOrigin,
     from_cursor: Option<usize>,
+    skipped: bool,
 }
 
 struct ManualAdvance {
@@ -1013,38 +1014,75 @@ impl App {
             && self.player.active
         {
             let current = current.clone();
-            let Some(entry) = self.queue_history.pop() else {
+            let Some(mut entry) = self.queue_history.pop() else {
                 return;
             };
+            while self
+                .queue_history
+                .last()
+                .is_some_and(|prior| prior.skipped && prior.uri == entry.previous.uri)
+                && let Some(prior) = self.queue_history.pop()
+            {
+                entry.previous = prior.previous;
+                entry.from_cursor = prior.from_cursor;
+            }
             match entry.origin {
                 TrackOrigin::Queue { revision, .. } if revision == self.queue_revision => {
                     self.queued.insert(0, current);
                 }
                 TrackOrigin::Queue { .. } => {}
-                TrackOrigin::Context(index) => {
-                    let shuffle = self.shuffle_enabled();
-                    if let (Some(context), Some(cursor)) =
-                        (self.context.as_mut(), entry.from_cursor)
-                    {
-                        context.cursor = cursor;
-                        context.played.remove(&index);
-                        context.reorder(shuffle);
-                        if shuffle
-                            && let Some(pos) = context.upcoming.iter().position(|&i| i == index)
-                        {
-                            context.upcoming.remove(pos);
-                            context.upcoming.insert(0, index);
-                        }
-                    }
-                }
+                TrackOrigin::Context(_) => {}
+            }
+            let replay = match entry.origin {
+                TrackOrigin::Context(index) => Some(index),
+                TrackOrigin::Queue { .. } => None,
+            };
+            if let Some(cursor) = entry.from_cursor {
+                self.rewind_context(cursor, replay);
             }
             self.refresh_queue_views();
             self.mark_manual_advance(Some(entry.previous.uri.clone()));
             self.send("play", json!({ "uri": entry.previous.uri }));
+        } else if let Some(context) = &self.context {
+            if self.shuffle_enabled() || context.cursor == 0 {
+                self.seek(0);
+                return;
+            }
+            let current = context.cursor;
+            let previous = current - 1;
+            let uri = context.tracks[previous].uri.clone();
+            if self.send("play", json!({ "uri": uri })) {
+                self.rewind_context(previous, Some(current));
+                self.refresh_queue_views();
+                self.mark_manual_advance(Some(uri));
+            }
         } else if self.player.connected {
             let _ = self.ws.send(soloist::Request::Previous);
         } else {
             self.error("soloist not connected");
+        }
+    }
+
+    fn rewind_context(&mut self, cursor: usize, replay: Option<usize>) {
+        let shuffle = self.shuffle_enabled();
+        let Some(context) = &mut self.context else {
+            return;
+        };
+        if context.cursor == cursor && replay.is_none() {
+            return;
+        }
+        context.cursor = cursor;
+        if let Some(index) = replay {
+            context.played.remove(&index);
+        }
+        context.played.insert(cursor);
+        context.reorder(shuffle);
+        if shuffle
+            && let Some(index) = replay
+            && let Some(pos) = context.upcoming.iter().position(|&i| i == index)
+        {
+            context.upcoming.remove(pos);
+            context.upcoming.insert(0, index);
         }
     }
 
@@ -1798,6 +1836,7 @@ impl App {
                     previous,
                     origin: start.origin,
                     from_cursor: start.from_cursor,
+                    skipped: false,
                 });
             }
             self.refresh_queue_views();
@@ -1850,7 +1889,19 @@ impl App {
             self.refresh_queue_views();
         }
         if (start_confirmed || manual_confirmed) && !self.skip_waiting() {
+            let skipping_ahead = start_confirmed && self.deferred_skip > 0;
             self.flush_deferred_skip();
+            if skipping_ahead
+                && self.queue_start.is_some()
+                && let Some(entry) = self.queue_history.last_mut()
+                && self
+                    .player
+                    .item
+                    .as_ref()
+                    .is_some_and(|item| item.uri == entry.uri)
+            {
+                entry.skipped = true;
+            }
         }
     }
 
@@ -2936,7 +2987,13 @@ mod tests {
         let (mut app, mut commands) = connected_app();
         let mut view = app.new_view("Album", Source::Album("test".into()));
         view.items = (0..3)
-            .map(|i| Item::new(Kind::Track, format!("spotify:track:{i}"), format!("Song {i}")))
+            .map(|i| {
+                Item::new(
+                    Kind::Track,
+                    format!("spotify:track:{i}"),
+                    format!("Song {i}"),
+                )
+            })
             .collect();
         app.player.item = view.items.first().cloned();
         app.push(view);
