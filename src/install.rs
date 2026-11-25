@@ -23,7 +23,11 @@ pub const EXE: &str = "soloist";
 /// Archive name for this platform, if Spotify publishes one.
 pub fn asset() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("soloist_release_osx_arm64.tar.gz"),
+        // Spotify only builds for Apple Silicon Macs. Anything else runs the
+        // Linux build in a container (see container.rs). This goes by the
+        // hardware, so an x86_64 str under Rosetta still gets the native one.
+        ("macos", _) if crate::container::wanted() => Some("soloist_release_x86_64.tar.gz"),
+        ("macos", _) => Some("soloist_release_osx_arm64.tar.gz"),
         ("linux", "x86_64") => Some("soloist_release_x86_64.tar.gz"),
         ("linux", "aarch64") => Some("soloist_release_arm64.tar.gz"),
         ("linux", "arm") => Some("soloist_release_arm32.tar.gz"),
@@ -100,11 +104,14 @@ impl Version {
 }
 
 pub fn version(bin: &Path) -> Option<Version> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = if crate::container::needed(bin) {
+        crate::container::version_command(bin).ok()?
+    } else {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--version");
+        cmd
+    };
+    let out = cmd.stdin(std::process::Stdio::null()).output().ok()?;
     out.status
         .success()
         .then(|| Version::parse(&String::from_utf8_lossy(&out.stdout)))
@@ -179,6 +186,9 @@ pub async fn install(http: &reqwest::Client, progress: impl Fn(u8)) -> Result<Ve
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
     }
+    if crate::container::needed(&exe) {
+        tokio::task::spawn_blocking(crate::container::build_image).await??;
+    }
     let exe2 = exe.clone();
     let ver = tokio::task::spawn_blocking(move || version(&exe2))
         .await?
@@ -212,8 +222,13 @@ mod tests {
 
     #[test]
     fn this_platform_has_an_asset() {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            assert_eq!(asset(), Some("soloist_release_osx_arm64.tar.gz"));
+        if cfg!(target_os = "macos") {
+            let want = if crate::container::wanted() {
+                "soloist_release_x86_64.tar.gz"
+            } else {
+                "soloist_release_osx_arm64.tar.gz"
+            };
+            assert_eq!(asset(), Some(want));
         }
     }
 }

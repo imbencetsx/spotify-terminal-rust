@@ -66,8 +66,17 @@ pub fn log_tail() -> Option<String> {
         .map(String::from)
 }
 
+/// Does this config's soloist run in a container (Intel Mac)? Its pid file
+/// then holds a pid from inside the container, so we ask the runtime instead.
+fn in_container(cfg: &Config) -> bool {
+    crate::install::find_bin(cfg).is_some_and(|b| crate::container::needed(&b))
+}
+
 /// Is a soloist (per its pid file) alive right now?
 pub fn daemon_running(cfg: &Config) -> bool {
+    if in_container(cfg) {
+        return crate::container::running();
+    }
     let Ok(pid) = std::fs::read_to_string(cfg.soloist_data_dir().join("soloist.pid")) else {
         return false;
     };
@@ -101,13 +110,23 @@ pub fn maybe_spawn(cfg: &Config) -> Result<Spawn> {
         return Ok(Spawn::Missing);
     };
     let name = cfg.soloist.device_name.as_deref().unwrap_or("str");
+    let container = crate::container::needed(&bin);
+    if container && !crate::container::image_ready()? {
+        // Installing builds the image.
+        return Ok(Spawn::Missing);
+    }
     std::fs::create_dir_all(config::cache_dir())?;
     let log = std::fs::File::create(log_path())?;
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(["-n", name, "-k", key, "--ws", "127.0.0.1:0"]);
-    if let Some(d) = &cfg.soloist.data_dir {
-        cmd.arg("-D").arg(d);
-    }
+    let mut cmd = if container {
+        crate::container::command(&bin, name, key, &cfg.soloist_data_dir())?
+    } else {
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.args(["-n", name, "-k", key, "--ws", "127.0.0.1:0"]);
+        if let Some(d) = &cfg.soloist.data_dir {
+            cmd.arg("-D").arg(d);
+        }
+        cmd
+    };
     cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -128,6 +147,9 @@ pub fn maybe_spawn(cfg: &Config) -> Result<Spawn> {
 
 /// Stop a Soloist started on this machine (via its pid file).
 pub fn stop(cfg: &Config) -> Result<()> {
+    if in_container(cfg) {
+        return crate::container::stop();
+    }
     let pid = std::fs::read_to_string(cfg.soloist_data_dir().join("soloist.pid"))
         .context("soloist doesn't seem to be running")?;
     let pid = pid.trim();
@@ -645,6 +667,7 @@ pub async fn shutdown_child(mut child: tokio::process::Child) -> Result<()> {
         }
     }
     child.kill().await?;
+    crate::container::cleanup().await;
     Ok(())
 }
 

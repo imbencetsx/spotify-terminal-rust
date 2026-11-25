@@ -35,6 +35,15 @@ Pick the device once in any Spotify app to log it in. `str` finds it automatical
 
 Install with `cargo install --path .`. Building on macOS uses the Apple Command Line Tools.
 
+### Macs without Apple Silicon
+
+Spotify only builds Soloist for Apple Silicon Macs. On any other Mac, `str` installs the Linux x86_64 build and runs it in a container. It goes by the hardware, so an x86_64 `str` under Rosetta still gets the native build. You need:
+
+- a container runtime: Docker Desktop, OrbStack, Colima or Podman, and it has to be running
+- PulseAudio for sound: `brew install pulseaudio`. `str` starts it and opens a listener on `127.0.0.1:4718` that only this Mac can reach. Set `PULSE_SERVER` to use a different server.
+
+The first install also builds a small runtime image (`str-soloist-runtime`), which takes about a minute. Spotify apps can't see a device inside the container's VM, so `str` advertises it over Bonjour with `dns-sd`. Pick it in a Spotify app on your network once to log it in, as usual. `STR_SOLOIST_CONTAINER=1` forces this setup on Apple Silicon too, which is useful for testing it.
+
 ## Use
 
 ```
