@@ -2,6 +2,7 @@ mod app;
 mod art;
 mod auth;
 mod config;
+mod container;
 mod install;
 mod lyrics;
 mod model;
